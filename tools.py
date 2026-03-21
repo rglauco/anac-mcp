@@ -609,42 +609,381 @@ async def get_contract_by_cig(cig: str) -> dict:
     }
 
 
+# ─────────────────────────────────────────────
+# Authority-type patterns for narrowing
+# ─────────────────────────────────────────────
+
+_ENTE_PATTERNS: dict[str, list[str]] = {
+    "comune": ["comune di %", "comune %"],
+    "asl": ["asl %", "azienda sanitaria%", "a.s.l.%", "ausl %"],
+    "provincia": ["provincia di %", "provincia %", "citta metropolitana%"],
+    "regione": ["regione %", "giunta regionale%"],
+    "universita": ["universita%", "università%", "politecnico%"],
+    "ministero": ["ministero%", "min. %"],
+    "azienda ospedaliera": ["azienda ospedaliera%", "a.o. %", "a.o.u.%", "ospedale%"],
+}
+
+# Common Italian stop words to exclude from keyword matching
+_STOP_WORDS = frozenset([
+    "servizi", "servizio", "fornitura", "lavori", "attivita", "attività",
+    "gestione", "affidamento", "appalto", "procedura", "esecuzione",
+    "relativo", "relativa", "relativi", "relative", "anno", "anni",
+    "periodo", "mesi", "tramite", "mediante", "della", "delle", "dello",
+    "degli", "nella", "nelle", "nello", "negli", "alla", "alle", "allo",
+    "agli", "dalla", "dalle", "dallo", "dagli", "sulla", "sulle", "sullo",
+    "come", "anche", "sono", "essere", "fare", "avere", "altro", "altra",
+    "altri", "altre", "ogni", "tutto", "tutti", "tutta", "tutte", "tipo",
+    "vari", "varie", "vario", "varia", "sede", "sedi", "lotto", "lotti",
+    "numero", "numeri", "codice", "euro", "importo", "base", "gara",
+    "contratto", "determina", "delibera",
+])
+
+
+def _extract_keywords(text: str) -> list[str]:
+    """Extract meaningful Italian keywords from procurement description.
+
+    Filters out stop words and short words to keep only content-bearing terms.
+    """
+    words = []
+    for w in text.lower().split():
+        w = w.strip(".,;:!?()[]{}\"'«»–—/\\")
+        if len(w) > 3 and w not in _STOP_WORDS:
+            words.append(w)
+    return words
+
+
+def _ente_where(tipo_ente: str) -> str | None:
+    """Build SQL clause to filter by authority type."""
+    key = tipo_ente.lower().strip()
+    patterns = _ENTE_PATTERNS.get(key)
+    if not patterns:
+        # Try partial match against keys
+        for k, v in _ENTE_PATTERNS.items():
+            if key in k or k in key:
+                patterns = v
+                break
+    if not patterns:
+        return None
+    clauses = " OR ".join([f"lower(denominazione_sa) LIKE '{p}'" for p in patterns])
+    return f"({clauses})"
+
+
+def _progressive_narrow(
+    keywords: list[str],
+    tipo_ente: str | None,
+    cpv_prefix: str | None,
+    region: str | None,
+    importo_previsto: float | None,
+    min_sample: int = 5,
+    max_sample: int = 50,
+) -> tuple[str, list, str, int]:
+    """Try progressively broader queries until we get min_sample–max_sample results.
+
+    Returns (where_clause, params, narrowing_description, attempt_number).
+    """
+
+    # Value band: 0.2x–5x of target amount
+    value_lo = importo_previsto * 0.2 if importo_previsto else None
+    value_hi = importo_previsto * 5.0 if importo_previsto else None
+
+    ente_clause = _ente_where(tipo_ente) if tipo_ente else None
+
+    def _base_wheres() -> tuple[list[str], list]:
+        w = ["importo_lotto > 0", "importo_lotto IS NOT NULL"]
+        p: list = []
+        if region:
+            w.append("lower(sezione_regionale) LIKE lower(?)")
+            p.append(f"%{region}%")
+        return w, p
+
+    def _add_value_band(w: list[str], p: list) -> None:
+        if value_lo is not None:
+            w.append(f"importo_lotto >= {value_lo}")
+            w.append(f"importo_lotto <= {value_hi}")
+
+    def _add_cpv(w: list[str], p: list) -> None:
+        if cpv_prefix:
+            w.append("cod_cpv LIKE ?")
+            p.append(f"{cpv_prefix.strip()}%")
+
+    def _count(where_clause: str, params: list) -> int:
+        r = _qry(f"SELECT COUNT(*) AS n FROM cig {where_clause}", params)
+        return int(r[0]["n"]) if r else 0
+
+    attempts = []
+
+    # ── Attempt 1: ALL keywords AND + ente type + value band ─────────
+    if keywords:
+        w, p = _base_wheres()
+        kw_and = " AND ".join([f"lower(oggetto_gara) LIKE ?" for _ in keywords])
+        w.append(f"({kw_and})")
+        p.extend([f"%{k}%" for k in keywords])
+        if ente_clause:
+            w.append(ente_clause)
+        _add_value_band(w, p)
+        _add_cpv(w, p)
+        wc = "WHERE " + " AND ".join(w)
+        n = _count(wc, p)
+        desc = (
+            f"Tutti i termini ({', '.join(keywords)})"
+            + (f" + tipo ente: {tipo_ente}" if ente_clause else "")
+            + (f" + fascia importo {_fmt_eur(value_lo)}–{_fmt_eur(value_hi)}" if value_lo else "")
+            + (f" + CPV {cpv_prefix}" if cpv_prefix else "")
+            + (f" + regione {region}" if region else "")
+        )
+        attempts.append((wc, p, desc, n, 1))
+        if min_sample <= n <= max_sample:
+            return wc, p, desc, 1
+
+    # ── Attempt 2: ALL keywords AND + value band (drop ente type) ────
+    if keywords:
+        w, p = _base_wheres()
+        kw_and = " AND ".join([f"lower(oggetto_gara) LIKE ?" for _ in keywords])
+        w.append(f"({kw_and})")
+        p.extend([f"%{k}%" for k in keywords])
+        _add_value_band(w, p)
+        _add_cpv(w, p)
+        wc = "WHERE " + " AND ".join(w)
+        n = _count(wc, p)
+        desc = (
+            f"Tutti i termini ({', '.join(keywords)})"
+            + (f" + fascia importo {_fmt_eur(value_lo)}–{_fmt_eur(value_hi)}" if value_lo else "")
+            + (f" + CPV {cpv_prefix}" if cpv_prefix else "")
+            + (f" + regione {region}" if region else "")
+        )
+        attempts.append((wc, p, desc, n, 2))
+        if min_sample <= n <= max_sample:
+            return wc, p, desc, 2
+
+    # ── Attempt 3: keyword scoring (match 2+ of N) + value band ──────
+    if len(keywords) >= 2:
+        w, p = _base_wheres()
+        score_cases = " + ".join(
+            [f"(CASE WHEN lower(oggetto_gara) LIKE '%{k}%' THEN 1 ELSE 0 END)"
+             for k in keywords]
+        )
+        # We need a subquery / CTE for the score filter
+        _add_value_band(w, p)
+        _add_cpv(w, p)
+        inner_where = "WHERE " + " AND ".join(w)
+        # Count with score >= 2
+        count_sql = f"""
+            SELECT COUNT(*) AS n FROM (
+                SELECT *, ({score_cases}) AS kw_score FROM cig {inner_where}
+            ) WHERE kw_score >= 2
+        """
+        n = int(_qry(count_sql, p)[0]["n"])
+        desc = (
+            f"Almeno 2 termini su {len(keywords)} ({', '.join(keywords)})"
+            + (f" + fascia importo" if value_lo else "")
+            + (f" + CPV {cpv_prefix}" if cpv_prefix else "")
+        )
+        # Build actual where for later use as a CTE-based approach
+        wc = f"__SCORED__|{inner_where}|{score_cases}"  # sentinel for scored query
+        attempts.append((wc, p, desc, n, 3))
+        if min_sample <= n <= max_sample:
+            return wc, p, desc, 3
+
+    # ── Attempt 4: ANY keyword OR + value band ───────────────────────
+    if keywords:
+        w, p = _base_wheres()
+        kw_or = " OR ".join([f"lower(oggetto_gara) LIKE ?" for _ in keywords])
+        w.append(f"({kw_or})")
+        p.extend([f"%{k}%" for k in keywords])
+        _add_value_band(w, p)
+        _add_cpv(w, p)
+        wc = "WHERE " + " AND ".join(w)
+        n = _count(wc, p)
+        desc = (
+            f"Almeno un termine ({', '.join(keywords)})"
+            + (f" + fascia importo" if value_lo else "")
+            + (f" + CPV {cpv_prefix}" if cpv_prefix else "")
+        )
+        attempts.append((wc, p, desc, n, 4))
+        if min_sample <= n <= max_sample:
+            return wc, p, desc, 4
+
+    # ── Attempt 5: CPV prefix + value band only (broadest) ───────────
+    if cpv_prefix:
+        w, p = _base_wheres()
+        _add_cpv(w, p)
+        _add_value_band(w, p)
+        wc = "WHERE " + " AND ".join(w)
+        n = _count(wc, p)
+        desc = (
+            f"Solo CPV {cpv_prefix}"
+            + (f" + fascia importo" if value_lo else "")
+            + " — campione ampio, interpretare con cautela"
+        )
+        attempts.append((wc, p, desc, n, 5))
+        if min_sample <= n <= max_sample:
+            return wc, p, desc, 5
+
+    # ── Fallback: pick the best attempt we have ──────────────────────
+    # Prefer the attempt closest to min_sample from above (i.e., smallest n >= 5),
+    # otherwise the one with the most results
+    valid = [(wc, p, d, n, a) for wc, p, d, n, a in attempts if n >= min_sample]
+    if valid:
+        # Pick the tightest (smallest n that's still >= min_sample)
+        best = min(valid, key=lambda x: x[3])
+        return best[0], best[1], best[2] + f" (n={best[3]})", best[4]
+
+    # Nothing reached min_sample — pick whatever has the most results
+    if attempts:
+        best = max(attempts, key=lambda x: x[3])
+        return best[0], best[1], best[2] + f" (n={best[3]}, campione insufficiente)", best[4]
+
+    # Absolute fallback
+    w, p = _base_wheres()
+    _add_value_band(w, p)
+    wc = "WHERE " + " AND ".join(w)
+    return wc, p, "Nessun filtro applicabile — intero database", 6
+
+
+def _run_stats_query(where_clause: str, params: list) -> dict:
+    """Run aggregation query, handling scored-query sentinel."""
+    if where_clause.startswith("__SCORED__"):
+        _, inner_where, score_expr = where_clause.split("|", 2)
+        sql = f"""
+            SELECT
+                COUNT(*) AS n,
+                AVG(importo_lotto) AS media,
+                MEDIAN(importo_lotto) AS mediana,
+                MIN(importo_lotto) AS minimo,
+                MAX(importo_lotto) AS massimo,
+                quantile_cont(importo_lotto, 0.25) AS p25,
+                quantile_cont(importo_lotto, 0.75) AS p75
+            FROM (
+                SELECT *, ({score_expr}) AS kw_score FROM cig {inner_where}
+            ) WHERE kw_score >= 2
+        """
+    else:
+        sql = f"""
+            SELECT
+                COUNT(*) AS n,
+                AVG(importo_lotto) AS media,
+                MEDIAN(importo_lotto) AS mediana,
+                MIN(importo_lotto) AS minimo,
+                MAX(importo_lotto) AS massimo,
+                quantile_cont(importo_lotto, 0.25) AS p25,
+                quantile_cont(importo_lotto, 0.75) AS p75
+            FROM cig {where_clause}
+        """
+    rows = _qry(sql, params)
+    return rows[0] if rows else {}
+
+
+def _run_sample_query(
+    where_clause: str,
+    params: list,
+    importo_previsto: float | None,
+    limit: int = 5,
+) -> list[dict]:
+    """Fetch best example contracts, handling scored-query sentinel."""
+    order = (
+        f"ABS(importo_lotto - {float(importo_previsto)}) ASC"
+        if importo_previsto and importo_previsto > 0
+        else "data_pubblicazione DESC NULLS LAST"
+    )
+
+    if where_clause.startswith("__SCORED__"):
+        _, inner_where, score_expr = where_clause.split("|", 2)
+        sql = f"""
+            SELECT * FROM (
+                SELECT cig, LEFT(oggetto_gara, 150) AS oggetto, importo_lotto,
+                       LEFT(denominazione_sa, 80) AS denominazione_sa,
+                       tipo_scelta_contraente AS procedura,
+                       data_pubblicazione, sezione_regionale,
+                       ({score_expr}) AS kw_score
+                FROM cig {inner_where}
+            ) WHERE kw_score >= 2
+            ORDER BY kw_score DESC, {order}
+            LIMIT {limit}
+        """
+    else:
+        sql = f"""
+            SELECT cig, LEFT(oggetto_gara, 150) AS oggetto, importo_lotto,
+                   LEFT(denominazione_sa, 80) AS denominazione_sa,
+                   tipo_scelta_contraente AS procedura,
+                   data_pubblicazione, sezione_regionale
+            FROM cig {where_clause}
+            ORDER BY {order}
+            LIMIT {limit}
+        """
+    return _qry(sql, params)
+
+
+def _run_procedure_breakdown(where_clause: str, params: list) -> list[dict]:
+    """Get procedure type distribution for the matched sample."""
+    if where_clause.startswith("__SCORED__"):
+        _, inner_where, score_expr = where_clause.split("|", 2)
+        sql = f"""
+            SELECT tipo_scelta_contraente AS procedura, COUNT(*) AS n
+            FROM (
+                SELECT *, ({score_expr}) AS kw_score FROM cig {inner_where}
+            ) WHERE kw_score >= 2
+            AND tipo_scelta_contraente IS NOT NULL AND tipo_scelta_contraente != ''
+            GROUP BY tipo_scelta_contraente ORDER BY n DESC LIMIT 6
+        """
+    else:
+        sql = f"""
+            SELECT tipo_scelta_contraente AS procedura, COUNT(*) AS n
+            FROM cig {where_clause}
+            AND tipo_scelta_contraente IS NOT NULL AND tipo_scelta_contraente != ''
+            GROUP BY tipo_scelta_contraente ORDER BY n DESC LIMIT 6
+        """
+    return _qry(sql, params)
+
+
 async def benchmark_market_prices(
     procurement_description: str,
     importo_previsto: Optional[float] = None,
     cpv_prefix: Optional[str] = None,
     region: Optional[str] = None,
+    tipo_ente: Optional[str] = None,
 ) -> dict:
     """
-    Benchmark market prices and generate a complete analisi di mercato paragraph.
+    Analisi di mercato completa per la PA: benchmark prezzi e testo per il fascicolo.
 
-    Queries comparable contracts from BDNCP, computes price statistics, and
-    produces a ready-to-paste paragraph for the fascicolo di gara — legally
-    compliant with D.Lgs. 36/2023 art. 14 (analisi di mercato).
-
-    The paragraph is generated even when sample size is small: the legal
-    requirement is to DOCUMENT the consultation of ANAC, not to find exact matches.
+    Questo strumento esegue un'analisi di mercato strutturata in 7 sezioni,
+    conforme all'art. 14 D.Lgs. 36/2023. Usa una strategia di ricerca
+    progressiva per trovare un campione ristretto di contratti comparabili
+    (5–50) invece di restituire migliaia di risultati generici.
 
     Parameters
     ----------
-    procurement_description : What the PA wants to procure (Italian text).
-                              E.g. 'servizi di pulizia uffici', 'sviluppo software gestionale'.
-    importo_previsto        : Planned spend in euros. ALWAYS pass this when the user
-                              mentions a budget — it determines congruity assessment
-                              and the legal procedure reference (art. 50 soglie).
-    cpv_prefix              : CPV prefix to narrow the category search.
-                              E.g. '90' for cleaning, '72' for IT services, '45' for works.
-    region                  : Limit benchmark to a specific Italian region.
+    procurement_description : Cosa deve acquistare la PA, in italiano naturale.
+                              Più specifico = migliore. Esempi:
+                              'manutenzione sito web istituzionale',
+                              'servizi pulizia uffici comunali',
+                              'sviluppo software gestionale sanitario'.
+    importo_previsto        : Budget previsto in euro. OBBLIGATORIO se l'utente
+                              menziona un importo. Determina la fascia di
+                              comparazione e la valutazione di congruità.
+    cpv_prefix              : Prefisso CPV (2–8 cifre). Esempi:
+                              '72'=IT, '90'=pulizia, '45'=costruzioni.
+    region                  : Regione italiana (es. 'Campania', 'Lombardia').
+    tipo_ente               : Tipo di stazione appaltante per restringere il
+                              confronto. Valori: 'Comune', 'ASL', 'Provincia',
+                              'Regione', 'Universita', 'Ministero',
+                              'Azienda ospedaliera'. Se l'utente dice "per il
+                              Comune" o "della ASL", passare questo parametro.
 
     Returns
     -------
-    price_statistics        : count, average, median, min, max, P25, P75
-    analisi_di_mercato_text : complete paste-ready paragraph for the fascicolo
-    comparable_contracts    : up to 10 example contracts with CIG and importo
+    Risposta strutturata in 7 sezioni pronta per il fascicolo di gara:
+    1. Ricognizione del mercato — criteri, periodo, qualità del campione
+    2. Distribuzione dei prezzi — n, min, P25, mediana, P75, max
+    3. Procedure utilizzate — distribuzione per tipo
+    4. Esempi concreti — 5 contratti reali con CIG, importo, ente
+    5. Valutazione di congruità — posizionamento vs quartili
+    6. Rischi e cautele — avvertenze quando necessario
+    7. Conclusioni operative — paragrafo per la determina
 
-    ROUTING: Use for ANY mention of 'analisi di mercato', 'affidamento diretto',
-    'congruità del prezzo', 'quanto costa', price benchmarks.
-    Always pass importo_previsto if the user mentions an amount.
+    ROUTING: Usare per QUALSIASI richiesta di analisi di mercato, congruità,
+    benchmark prezzi, verifica importo, supporto affidamento.
+    SEMPRE passare importo_previsto se l'utente menziona un budget.
+    SEMPRE passare tipo_ente se l'utente menziona il tipo di ente.
     """
     not_ready = _check_ready()
     if not_ready:
@@ -653,191 +992,337 @@ async def benchmark_market_prices(
     today_str = date.today().strftime("%d/%m/%Y")
     months_str = ", ".join(sorted(_db_status["months_loaded"]))
 
-    # Build filter
-    wheres = ["importo_lotto > 0", "importo_lotto IS NOT NULL"]
-    params: list = []
-
-    # Keyword: match ANY significant word (OR logic = broader recall)
-    words = [w for w in procurement_description.split() if len(w) > 3]
-    if words:
-        kw_clause = " OR ".join(
-            ["lower(oggetto_gara) LIKE lower(?)" for _ in words]
-        )
-        wheres.append(f"({kw_clause})")
-        params.extend([f"%{w}%" for w in words])
-
-    if cpv_prefix:
-        wheres.append("cod_cpv LIKE ?")
-        params.append(f"{cpv_prefix.strip()}%")
-
-    if region:
-        wheres.append("lower(sezione_regionale) LIKE lower(?)")
-        params.append(f"%{region}%")
-
-    where_clause = "WHERE " + " AND ".join(wheres)
-
-    # Statistics
-    stats_rows = _qry(
-        f"""
-        SELECT
-            COUNT(*)                                                    AS n,
-            AVG(importo_lotto)                                         AS media,
-            MEDIAN(importo_lotto)                                      AS mediana,
-            MIN(importo_lotto)                                         AS minimo,
-            MAX(importo_lotto)                                         AS massimo,
-            quantile_cont(importo_lotto, 0.25)                        AS p25,
-            quantile_cont(importo_lotto, 0.75)                        AS p75
-        FROM cig
-        {where_clause}
-        """,
-        params,
+    # ── 1. Progressive narrowing ─────────────────────────────────────
+    keywords = _extract_keywords(procurement_description)
+    where_clause, params, narrowing_desc, attempt_num = _progressive_narrow(
+        keywords=keywords,
+        tipo_ente=tipo_ente,
+        cpv_prefix=cpv_prefix,
+        region=region,
+        importo_previsto=importo_previsto,
     )
-    s = stats_rows[0] if stats_rows else {}
+
+    # ── 2. Statistics on the narrowed sample ─────────────────────────
+    s = _run_stats_query(where_clause, params)
     n = int(s.get("n") or 0)
 
-    # Sample contracts (up to 10, most recent)
-    sample_rows = _qry(
-        f"""
-        SELECT
-            cig,
-            LEFT(oggetto_gara, 100)  AS oggetto,
-            importo_lotto,
-            LEFT(denominazione_sa, 80) AS denominazione_sa,
-            data_pubblicazione,
-            sezione_regionale
-        FROM cig
-        {where_clause}
-        ORDER BY data_pubblicazione DESC NULLS LAST
-        LIMIT 10
-        """,
-        params,
+    # ── 3. Procedure breakdown ───────────────────────────────────────
+    proc_rows = _run_procedure_breakdown(where_clause, params)
+    proc_total = sum(r["n"] for r in proc_rows) or 1
+
+    # ── 4. Best examples (by proximity to target amount) ─────────────
+    sample_rows = _run_sample_query(where_clause, params, importo_previsto, limit=5)
+
+    # ── 5. Quality assessment ────────────────────────────────────────
+    if attempt_num <= 2 and n >= 5:
+        qualita_campione = "alta"
+        qualita_nota = "Campione ristretto con alta comparabilità (tutti i termini di ricerca corrispondenti)."
+    elif attempt_num == 3 and n >= 5:
+        qualita_campione = "buona"
+        qualita_nota = "Campione con buona comparabilità (la maggior parte dei termini corrispondenti)."
+    elif attempt_num == 4 and n >= 5:
+        qualita_campione = "moderata"
+        qualita_nota = "Campione più ampio con comparabilità moderata. Verificare manualmente la pertinenza degli esempi."
+    elif attempt_num >= 5:
+        qualita_campione = "bassa"
+        qualita_nota = "Campione basato su corrispondenza CPV ampia. Interpretare le statistiche con cautela e integrare con altre fonti."
+    elif n < 5:
+        qualita_campione = "insufficiente"
+        qualita_nota = f"Solo {n} contratti trovati — campione insufficiente per un'analisi statistica affidabile. Integrare con dataset storici ANAC e fonti Consip."
+    else:
+        qualita_campione = "moderata"
+        qualita_nota = ""
+
+    # ── 6. Congruity assessment (quartile-based) ─────────────────────
+    congruita = {}
+    rischi: list[str] = []
+    if importo_previsto and importo_previsto > 0 and n >= 3:
+        mediana = s.get("mediana")
+        p25 = s.get("p25")
+        p75 = s.get("p75")
+        massimo = s.get("massimo")
+        minimo = s.get("minimo")
+
+        if mediana and p25 and p75:
+            if importo_previsto < minimo:
+                giudizio = "inferiore al minimo osservato"
+                motivazione = (
+                    f"L'importo previsto ({_fmt_eur(importo_previsto)}) è inferiore "
+                    f"al minimo osservato nel campione ({_fmt_eur(minimo)}). "
+                    f"Verificare la completezza della prestazione e la sostenibilità economica."
+                )
+                rischi.append("Importo sotto il minimo di mercato: rischio di prestazione incompleta o sotto-dimensionata.")
+            elif importo_previsto <= p25:
+                giudizio = "sotto il primo quartile — fascia bassa"
+                motivazione = (
+                    f"L'importo previsto ({_fmt_eur(importo_previsto)}) si colloca "
+                    f"sotto il primo quartile ({_fmt_eur(p25)}). Prezzo competitivo, "
+                    f"verificare che la prestazione sia completa e il prezzo sostenibile."
+                )
+            elif importo_previsto <= mediana:
+                giudizio = "congruo — nella fascia inferiore del mercato"
+                motivazione = (
+                    f"L'importo previsto ({_fmt_eur(importo_previsto)}) si colloca "
+                    f"tra il primo quartile ({_fmt_eur(p25)}) e la mediana ({_fmt_eur(mediana)}). "
+                    f"Il prezzo è congruo rispetto al mercato rilevato."
+                )
+            elif importo_previsto <= p75:
+                giudizio = "congruo — in linea con il mercato"
+                motivazione = (
+                    f"L'importo previsto ({_fmt_eur(importo_previsto)}) si colloca "
+                    f"tra la mediana ({_fmt_eur(mediana)}) e il terzo quartile ({_fmt_eur(p75)}). "
+                    f"Il prezzo è in linea con i valori di mercato."
+                )
+            elif importo_previsto <= massimo:
+                giudizio = "sopra il terzo quartile — motivazione rafforzata consigliata"
+                motivazione = (
+                    f"L'importo previsto ({_fmt_eur(importo_previsto)}) supera il terzo "
+                    f"quartile ({_fmt_eur(p75)}) ma resta entro il massimo osservato "
+                    f"({_fmt_eur(massimo)}). Si raccomanda una motivazione rafforzata nella determina."
+                )
+                rischi.append(
+                    f"Importo sopra il P75 ({_fmt_eur(p75)}): nella determina motivare "
+                    f"la ragione del costo superiore alla prassi prevalente."
+                )
+            else:
+                giudizio = "superiore al massimo osservato — richiede forte motivazione"
+                motivazione = (
+                    f"L'importo previsto ({_fmt_eur(importo_previsto)}) supera il massimo "
+                    f"osservato nel campione ({_fmt_eur(massimo)}). "
+                    f"Necessaria una motivazione dettagliata nella determina con evidenza "
+                    f"di specificità del fabbisogno o fattori di costo eccezionali."
+                )
+                rischi.append(
+                    f"Importo sopra il massimo di mercato ({_fmt_eur(massimo)}): "
+                    f"elevato rischio di contestazione in sede di audit o controllo."
+                )
+                rischi.append(
+                    "Valutare la possibilità di frazionare in lotti, "
+                    "richiedere preventivi aggiuntivi, o adeguare le specifiche tecniche."
+                )
+
+            congruita = {
+                "giudizio": giudizio,
+                "motivazione": motivazione,
+                "importo_previsto": _fmt_eur(importo_previsto),
+                "posizione_vs_mediana": f"{importo_previsto / mediana:.2f}x" if mediana else "N/D",
+                "posizione_vs_p25_p75": (
+                    f"{_fmt_eur(p25)} – {_fmt_eur(p75)}"
+                ),
+            }
+    elif importo_previsto and importo_previsto > 0 and n < 3:
+        congruita = {
+            "giudizio": "non valutabile — campione insufficiente",
+            "motivazione": (
+                f"Importo previsto: {_fmt_eur(importo_previsto)}. "
+                f"Con sole {n} osservazioni non è possibile una valutazione "
+                f"statistica affidabile. Integrare con altre fonti."
+            ),
+        }
+        rischi.append(
+            f"Campione di {n} contratti insufficiente per una valutazione statistica. "
+            f"Integrare con dataset storici ANAC (https://dati.anticorruzione.it/opendata/dataset/cig) "
+            f"e convenzioni Consip (https://www.acquistinretepa.it)."
+        )
+
+    # Additional risk checks
+    if n > 100:
+        rischi.append(
+            f"Campione ampio ({n} contratti) — possibile eterogeneità. "
+            f"Verificare che gli esempi siano effettivamente comparabili."
+        )
+    if qualita_campione == "bassa":
+        rischi.append(
+            "Ricerca basata su CPV ampio, non su corrispondenza testuale. "
+            "Le statistiche potrebbero includere oggetti non comparabili."
+        )
+
+    # ── 7. Procedure reference ───────────────────────────────────────
+    if importo_previsto and importo_previsto <= 140_000:
+        proc_ref = (
+            "Affidamento diretto ai sensi dell'art. 50, co. 1, lett. b), "
+            "D.Lgs. 36/2023 (soglia servizi/forniture ≤ €140.000)."
+        )
+    elif importo_previsto and importo_previsto <= 215_000:
+        proc_ref = (
+            "Procedura negoziata senza bando previa consultazione di almeno "
+            "cinque operatori economici, ai sensi dell'art. 50, co. 1, "
+            "lett. c), D.Lgs. 36/2023."
+        )
+    elif importo_previsto and importo_previsto <= 5_382_000:
+        proc_ref = (
+            "Procedura negoziata o aperta ai sensi dell'art. 50, co. 1, "
+            "lett. d), D.Lgs. 36/2023."
+        )
+    elif importo_previsto:
+        proc_ref = (
+            "Procedura di gara aperta ai sensi del D.Lgs. 36/2023 — "
+            "importo sopra soglia comunitaria."
+        )
+    else:
+        proc_ref = (
+            "Procedura da determinare in base all'importo a base di gara "
+            "(art. 50, D.Lgs. 36/2023)."
+        )
+
+    # ── Build 7-section analisi di mercato text ──────────────────────
+
+    # Section 1: Ricognizione
+    sez1 = (
+        f"1. RICOGNIZIONE DEL MERCATO\n\n"
+        f"Oggetto della ricerca: {procurement_description}\n"
+        f"{'Importo previsto: ' + _fmt_eur(importo_previsto) if importo_previsto else ''}\n"
+        f"Fonte: ANAC — Banca Dati Nazionale Contratti Pubblici (BDNCP)\n"
+        f"Periodo campionato: {months_str}\n"
+        f"{'Categoria CPV: ' + cpv_prefix if cpv_prefix else ''}\n"
+        f"{'Area geografica: ' + region if region else 'Area geografica: nazionale'}\n"
+        f"{'Tipo ente: ' + tipo_ente if tipo_ente else ''}\n"
+        f"Criterio di selezione: {narrowing_desc}\n"
+        f"Qualità del campione: {qualita_campione} — {qualita_nota}\n"
     )
 
-    # ── Build analisi di mercato text ─────────────────────────────────────
-
-    if n >= 5:
-        stats_block = (
-            f"La consultazione della Banca Dati Nazionale Contratti Pubblici (BDNCP) "
-            f"ha restituito {n:,} contratti comparabili per «{procurement_description}» "
-            f"nel periodo {months_str}.\n\n"
-            f"Statistiche dei prezzi rilevati:\n"
-            f"  • Importo medio:            {_fmt_eur(s.get('media'))}\n"
-            f"  • Mediana:                  {_fmt_eur(s.get('mediana'))}\n"
-            f"  • Range osservato:          {_fmt_eur(s.get('minimo'))} – {_fmt_eur(s.get('massimo'))}\n"
-            f"  • Intervallo centrale P25–P75: {_fmt_eur(s.get('p25'))} – {_fmt_eur(s.get('p75'))}\n"
+    # Section 2: Distribuzione prezzi
+    if n >= 3:
+        sez2 = (
+            f"2. DISTRIBUZIONE DEI PREZZI (n = {n})\n\n"
+            f"  • Minimo:     {_fmt_eur(s.get('minimo'))}\n"
+            f"  • P25:        {_fmt_eur(s.get('p25'))}\n"
+            f"  • Mediana:    {_fmt_eur(s.get('mediana'))}\n"
+            f"  • P75:        {_fmt_eur(s.get('p75'))}\n"
+            f"  • Massimo:    {_fmt_eur(s.get('massimo'))}\n"
+            f"  • Media:      {_fmt_eur(s.get('media'))} (da usare con cautela se distribuzione asimmetrica)\n"
         )
     elif n > 0:
-        stats_block = (
-            f"La consultazione della BDNCP ha restituito {n} contratto/i comparabile/i "
-            f"per «{procurement_description}» nel periodo {months_str} "
-            f"(campione limitato; si raccomanda di integrare con i dataset storici completi).\n\n"
-            f"  • Importo medio: {_fmt_eur(s.get('media'))}\n"
+        sez2 = (
+            f"2. DISTRIBUZIONE DEI PREZZI (n = {n} — campione limitato)\n\n"
             f"  • Range: {_fmt_eur(s.get('minimo'))} – {_fmt_eur(s.get('massimo'))}\n"
+            f"  • Media: {_fmt_eur(s.get('media'))}\n"
+            f"  ⚠ Campione troppo piccolo per statistiche affidabili.\n"
         )
     else:
-        stats_block = (
-            f"La consultazione della BDNCP per «{procurement_description}» "
-            f"nel periodo {months_str} non ha restituito contratti comparabili "
-            f"con i criteri di ricerca specificati.\n"
-            f"Si raccomanda di consultare i dataset storici completi:\n"
-            f"  https://dati.anticorruzione.it/opendata/dataset/cig\n"
-            f"e le convenzioni Consip attive:\n"
-            f"  https://www.acquistinretepa.it\n"
+        sez2 = (
+            f"2. DISTRIBUZIONE DEI PREZZI\n\n"
+            f"  Nessun contratto comparabile trovato nel periodo campionato.\n"
         )
 
-    # Congruity assessment
-    congruity_block = ""
-    if importo_previsto and importo_previsto > 0:
-        media = s.get("media")
-        if n >= 3 and media:
-            ratio = importo_previsto / media
-            if ratio < 0.5:
-                valutazione = "significativamente inferiore alla media di mercato"
-            elif ratio < 0.8:
-                valutazione = "inferiore alla media di mercato"
-            elif ratio <= 1.2:
-                valutazione = "in linea con i valori di mercato rilevati"
-            elif ratio <= 1.5:
-                valutazione = "superiore alla media di mercato"
-            else:
-                valutazione = "significativamente superiore alla media di mercato"
-            congruity_block = (
-                f"\nVerifica di congruità: l'importo previsto di {_fmt_eur(importo_previsto)} "
-                f"risulta {valutazione} (media di mercato: {_fmt_eur(media)}, "
-                f"rapporto previsto/media: {ratio:.2f}).\n"
-            )
-        else:
-            congruity_block = (
-                f"\nImporto previsto: {_fmt_eur(importo_previsto)}. "
-                "Confronto statistico non disponibile per insufficienza del campione.\n"
-            )
+    # Section 3: Procedure utilizzate
+    if proc_rows:
+        proc_lines = []
+        for r in proc_rows:
+            pct = r["n"] / proc_total * 100
+            proc_lines.append(f"  • {r['procedura']}: {r['n']} ({pct:.0f}%)")
+        sez3 = f"3. PROCEDURE UTILIZZATE NELLA PRATICA\n\n" + "\n".join(proc_lines) + "\n"
+    else:
+        sez3 = "3. PROCEDURE UTILIZZATE\n\n  Dati non disponibili.\n"
 
-    # Procedure reference based on amount
-    if importo_previsto and importo_previsto <= 140_000:
-        conclusioni = (
-            "L'amministrazione procederà all'affidamento diretto ai sensi "
-            "dell'art. 50, co. 1, lett. b), D.Lgs. 36/2023, avendo verificato "
-            "la congruità del prezzo attraverso la presente analisi di mercato."
+    # Section 4: Esempi concreti
+    if sample_rows:
+        esempio_lines = []
+        for i, r in enumerate(sample_rows, 1):
+            esempio_lines.append(
+                f"  {i}. CIG {r['cig']} — {_fmt_eur(r['importo_lotto'])}\n"
+                f"     Oggetto: {r['oggetto']}\n"
+                f"     Ente: {r['denominazione_sa']}\n"
+                f"     Procedura: {r.get('procedura', 'N/D')}\n"
+                f"     Data: {r.get('data_pubblicazione', 'N/D')}\n"
+            )
+        sez4 = f"4. ESEMPI CONCRETI\n\n" + "\n".join(esempio_lines)
+    else:
+        sez4 = "4. ESEMPI CONCRETI\n\n  Nessun esempio disponibile.\n"
+
+    # Section 5: Valutazione di congruità
+    if congruita:
+        sez5 = (
+            f"5. VALUTAZIONE DI CONGRUITÀ\n\n"
+            f"  Giudizio: {congruita.get('giudizio', 'N/D')}\n"
+            f"  {congruita.get('motivazione', '')}\n"
         )
-    elif importo_previsto and importo_previsto <= 5_538_000:
-        conclusioni = (
-            "L'amministrazione procederà con procedura negoziata previa consultazione "
-            "di almeno cinque operatori economici, ai sensi dell'art. 50, co. 1, "
-            "lett. c/d), D.Lgs. 36/2023."
+    elif importo_previsto:
+        sez5 = (
+            f"5. VALUTAZIONE DI CONGRUITÀ\n\n"
+            f"  Importo previsto: {_fmt_eur(importo_previsto)}\n"
+            f"  Valutazione non disponibile per insufficienza del campione.\n"
         )
     else:
-        conclusioni = (
-            "L'amministrazione ha svolto la presente analisi di mercato preliminare "
-            "ai sensi dell'art. 14, D.Lgs. 36/2023, quale supporto alla procedura "
-            "di gara da avviare."
+        sez5 = (
+            f"5. VALUTAZIONE DI CONGRUITÀ\n\n"
+            f"  Importo previsto non indicato — impossibile valutare la congruità.\n"
         )
 
-    analisi_text = f"""ANALISI DI MERCATO
-(ai sensi dell'art. 14, D.Lgs. 36/2023 — Codice dei Contratti Pubblici)
+    # Section 6: Rischi e cautele
+    if rischi:
+        rischi_lines = "\n".join([f"  ⚠ {r}" for r in rischi])
+        sez6 = f"6. RISCHI E CAUTELE\n\n{rischi_lines}\n"
+    else:
+        sez6 = "6. RISCHI E CAUTELE\n\n  Nessun rischio specifico rilevato.\n"
 
-Data: {today_str}
-Oggetto: {procurement_description}{f'{chr(10)}Importo previsto: {_fmt_eur(importo_previsto)}' if importo_previsto else ''}{f'{chr(10)}Categoria CPV: {cpv_prefix}' if cpv_prefix else ''}{f'{chr(10)}Area geografica: {region}' if region else chr(10) + 'Area geografica: nazionale'}
+    # Section 7: Conclusioni operative
+    sez7 = (
+        f"7. CONCLUSIONI OPERATIVE\n\n"
+        f"La presente analisi di mercato, condotta ai sensi dell'art. 14 del D.Lgs. 36/2023, "
+        f"ha preso in esame {n} contratti pubblici comparabili presenti nella BDNCP-ANAC "
+        f"nel periodo {months_str}. "
+    )
+    if congruita.get("giudizio"):
+        sez7 += f"L'importo previsto di {_fmt_eur(importo_previsto)} risulta {congruita['giudizio']}. "
+    sez7 += (
+        f"\n\nRiferimento procedurale: {proc_ref}\n\n"
+        f"Fonti: ANAC BDNCP (CC-BY-SA 4.0), periodo {months_str}. "
+        f"Si raccomanda di integrare con verifica delle convenzioni Consip attive "
+        f"(www.acquistinretepa.it) e, ove disponibili, preventivi di mercato.\n"
+    )
 
-RISULTATI DELLA RICOGNIZIONE DI MERCATO
-
-{stats_block}{congruity_block}
-FONTI CONSULTATE
-1. ANAC — Banca Dati Nazionale Contratti Pubblici (BDNCP)
-   URL: https://dati.anticorruzione.it
-   Periodo campionato: {months_str}
-   Licenza: CC-BY-SA 4.0
-
-2. Consip SpA — Convenzioni e Accordi Quadro attivi
-   URL: https://www.acquistinretepa.it
-   (verifica in carico al RUP)
-
-CONCLUSIONI
-{conclusioni}
-
-{CITATION}"""
+    analisi_text = (
+        f"ANALISI DI MERCATO\n"
+        f"(ai sensi dell'art. 14, D.Lgs. 36/2023 — Codice dei Contratti Pubblici)\n"
+        f"Data: {today_str}\n\n"
+        f"{sez1}\n{sez2}\n{sez3}\n{sez4}\n{sez5}\n{sez6}\n{sez7}"
+    )
 
     return {
-        "price_statistics": {
-            "sample_size": n,
-            "average": round(s["media"], 2) if s.get("media") else None,
-            "median": round(s["mediana"], 2) if s.get("mediana") else None,
-            "min": round(s["minimo"], 2) if s.get("minimo") else None,
-            "max": round(s["massimo"], 2) if s.get("massimo") else None,
+        "ricognizione": {
+            "oggetto": procurement_description,
+            "importo_previsto": _fmt_eur(importo_previsto) if importo_previsto else None,
+            "criteri_selezione": narrowing_desc,
+            "qualita_campione": qualita_campione,
+            "nota_qualita": qualita_nota,
+            "tentativo_utilizzato": attempt_num,
+            "periodo": months_str,
+        },
+        "distribuzione_prezzi": {
+            "n": n,
+            "media": round(s["media"], 2) if s.get("media") else None,
+            "mediana": round(s["mediana"], 2) if s.get("mediana") else None,
+            "minimo": round(s["minimo"], 2) if s.get("minimo") else None,
+            "massimo": round(s["massimo"], 2) if s.get("massimo") else None,
             "p25": round(s["p25"], 2) if s.get("p25") else None,
             "p75": round(s["p75"], 2) if s.get("p75") else None,
         },
-        "comparable_contracts": [
+        "procedure_utilizzate": [
+            {
+                "procedura": r["procedura"],
+                "n": r["n"],
+                "percentuale": round(r["n"] / proc_total * 100, 1),
+            }
+            for r in proc_rows
+        ],
+        "esempi_concreti": [
             {
                 "cig": r["cig"],
                 "oggetto": r["oggetto"],
                 "importo": _fmt_eur(r["importo_lotto"]),
+                "importo_raw": r["importo_lotto"],
                 "stazione_appaltante": r["denominazione_sa"],
-                "data": r["data_pubblicazione"],
-                "regione": r["sezione_regionale"],
+                "procedura": r.get("procedura"),
+                "data": r.get("data_pubblicazione"),
+                "regione": r.get("sezione_regionale"),
                 "detail_url": DETAIL_URL.format(cig=r["cig"]),
             }
             for r in sample_rows
         ],
+        "valutazione_congruita": congruita,
+        "rischi_e_cautele": rischi,
+        "riferimento_procedurale": proc_ref,
         "analisi_di_mercato_text": analisi_text,
         "coverage": _coverage(),
         "citation": CITATION,

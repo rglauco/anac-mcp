@@ -60,55 +60,70 @@ mcp = FastMCP(
     instructions="""Accesso alla Banca Dati Nazionale Contratti Pubblici (BDNCP) gestita da ANAC.
 Dati pubblici, licenza CC-BY-SA 4.0. Nessuna credenziale richiesta.
 
-== CAPACITÀ REALI DEL SERVER ==
-Il server scarica i dati CSV mensili di ANAC (decine di migliaia di contratti per mese)
-e li carica in un database DuckDB in-memory. Tutti gli strumenti eseguono query SQL
-con risposte in meno di 1 secondo. Copertura: ultimi 3–12 mesi.
+== CAPACITÀ DEL SERVER ==
+Il server carica centinaia di migliaia di contratti ANAC reali in DuckDB in-memory.
+Query SQL in meno di 1 secondo. Copertura: ultimi 3–12 mesi.
+Al primo avvio: 2–3 minuti per caricarsi. Se "initializing"/"loading", riprovare tra 60s.
 
-Al primo avvio il database impiega 2–3 minuti a caricarsi. Se lo stato è "initializing"
-o "loading", comunica all'utente di riprovare tra 60 secondi.
+== DECISION TREE ==
 
-== DECISION TREE: quale strumento usare ==
+SE l'utente chiede analisi di mercato, congruità prezzo, benchmark, "quanto costa",
+   verifica importo, supporto affidamento, "è un prezzo giusto", comparazione:
+   → benchmark_market_prices()
+   QUESTO È LO STRUMENTO PRINCIPALE. Produce un'analisi completa in 7 sezioni.
+   REGOLE OBBLIGATORIE:
+   - SEMPRE passare importo_previsto se l'utente menziona un budget/importo
+   - SEMPRE passare tipo_ente se l'utente menziona il tipo di ente:
+     "per il Comune" → tipo_ente="Comune"
+     "della ASL" → tipo_ente="ASL"
+     "per la Provincia" → tipo_ente="Provincia"
+     "dell'Università" → tipo_ente="Universita"
+     "dell'ospedale" → tipo_ente="Azienda ospedaliera"
+   - procurement_description deve essere SPECIFICO, non generico:
+     BENE: "manutenzione sito web istituzionale"
+     MALE: "servizi informatici" (troppo generico)
+   - Se il CPV è noto o deducibile, passare cpv_prefix
+   Lo strumento usa ricerca progressiva: parte stretto e allarga automaticamente.
+   Restituisce 7 sezioni: ricognizione, prezzi, procedure, esempi, congruità,
+   rischi, conclusioni. Il testo è pronto per il fascicolo di gara.
 
-1. Cercare contratti (per keyword, CPV, regione, importo, procedura, stato)
+SE l'utente cerca contratti genericamente (senza bisogno di analisi statistica):
    → search_contracts(keyword=..., cpv_prefix=..., region=..., importo_min=..., importo_max=...)
-   PRIMO strumento da chiamare per qualsiasi ricerca di contratti.
-   Restituisce fino a 25 contratti con tutti i dettagli, ordinati per data.
-   SEMPRE usare termini italiani per keyword (es. 'servizi informatici', non 'IT services').
+   Fino a 25 contratti. SEMPRE usare termini italiani.
 
-2. Cercare un CIG specifico
+SE l'utente fornisce un CIG specifico:
    → get_contract_by_cig(cig="XXXXXXXXXX")
-   Lookup diretto per codice CIG (10 caratteri alfanumerici).
-   Include dati dell'ente dall'anagrafica ANAC (tipo, provincia, città).
 
-3. Analisi di mercato / benchmark prezzi / congruità importo
-   → benchmark_market_prices(procurement_description=..., importo_previsto=..., cpv_prefix=...)
-   SEMPRE passare importo_previsto se l'utente menziona un budget o importo.
-   Restituisce SEMPRE un paragrafo completo pronto per il fascicolo,
-   conforme all'art. 14 D.Lgs. 36/2023, anche con campione piccolo.
-   Il paragrafo è legalmente valido: documenta la consultazione ANAC.
+SE l'utente chiede il profilo acquisti di un ente specifico:
+   → get_authority_procurement_profile(authority_name=...)
 
-4. Profilo acquisti di un ente
-   → get_authority_procurement_profile(authority_name=...) o (codice_fiscale=...)
-   Statistiche complete: n. contratti, valore totale/medio, top CPV, procedure usate,
-   ultimi 10 contratti. Funziona con nome parziale (es. 'Comune di Roma').
+SE l'utente vuole trovare contratti comparabili per evidenza:
+   → find_similar_contracts(procurement_description=..., importo_riferimento=...)
 
-5. Trovare contratti simili per comparazione
-   → find_similar_contracts(procurement_description=..., cpv_prefix=..., importo_riferimento=...)
-   Ordinati per prossimità a importo_riferimento se fornito.
-   Utile per costruire la base evidenziale dell'analisi di mercato.
+== FORMATO RISPOSTE PER ANALISI DI MERCATO ==
+Quando usi benchmark_market_prices, presenta la risposta seguendo le 7 sezioni
+restituite dallo strumento. NON riscrivere o semplificare il contenuto.
+Includi SEMPRE:
+- Le statistiche (mediana, P25–P75, range)
+- Gli esempi concreti con CIG
+- La valutazione di congruità con posizionamento vs quartili
+- I rischi e cautele quando presenti
+- Le conclusioni operative
+
+Se qualita_campione è "bassa" o "insufficiente", EVIDENZIALO chiaramente.
+Se ci sono rischi, NON ometterli per sembrare più positivo.
 
 == PARAMETRI CHIAVE ==
 cpv_prefix (2+ cifre): '45'=Costruzione, '48'=Software, '72'=Servizi IT,
   '79'=Servizi aziendali, '85'=Sanità, '90'=Ambiente/Pulizia
 region: nome regione italiana (es. 'Campania', 'Lombardia', 'Lazio')
 tipo_procedura: 'AFFIDAMENTO DIRETTO', 'PROCEDURA APERTA', 'PROCEDURA NEGOZIATA'
+tipo_ente: 'Comune', 'ASL', 'Provincia', 'Regione', 'Universita', 'Ministero',
+  'Azienda ospedaliera'
 
-== LINEE GUIDA RISPOSTE ==
-- Includere sempre la copertura temporale (campo coverage.months_loaded)
-- Includere sempre la citazione ANAC dal campo citation
-- Se total_matching > returned, suggerire filtri più specifici
-- Per dati storici oltre i 12 mesi: https://dati.anticorruzione.it/opendata/dataset/cig""",
+== LINEE GUIDA GENERALI ==
+- Includere sempre copertura temporale e citazione ANAC
+- Per dati storici oltre 12 mesi: https://dati.anticorruzione.it/opendata/dataset/cig""",
     version="1.0.0",
     website_url="https://dati.anticorruzione.it",
 )
