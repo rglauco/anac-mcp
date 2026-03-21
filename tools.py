@@ -560,82 +560,115 @@ def search_contracts(
 # Tool 2: get_contract_by_cig
 # ─────────────────────────────────────────────
 
+CIG_API_BASE = "https://api.anticorruzione.it/apicig/1.0.0"
+CIG_API_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+}
+
+
+def _fetch_cig(cig: str) -> Optional[dict]:
+    """
+    Call /getSmartCig/{CIG}. Returns parsed contract dict or None.
+    Fast (~2s). Works for all CIG types (ordinary, smart, PNRR).
+    codice_risposta == 'NOKSN' means found; 'NOKCN' means not found.
+    """
+    try:
+        with httpx.Client(timeout=15.0, verify=False, headers=CIG_API_HEADERS) as client:
+            resp = client.get(f"{CIG_API_BASE}/getSmartCig/{cig}")
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        if data.get("codice_risposta") == "NOKCN" or not data.get("bando"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _parse_cig_response(data: dict) -> dict:
+    """Flatten the /getSmartCig response into a clean contract dict."""
+    bando = data.get("bando", {})
+    sa = data.get("stazione_appaltante", {}) or {}
+    pub = data.get("pubblicazioni", {}) or {}
+    incaricati = data.get("incaricati", []) or []
+
+    cpv_list = bando.get("CPV", []) or []
+    cpv_code = cpv_list[0].get("COD_CPV", "") if cpv_list else ""
+    cpv_desc = cpv_list[0].get("DESCRIZIONE_CPV", "") if cpv_list else ""
+
+    rup = next((i for i in incaricati if i.get("COD_RUOLO") == "RUP"), None)
+    rup_name = f"{rup.get('NOME', '')} {rup.get('COGNOME', '')}".strip() if rup else ""
+
+    importo = bando.get("IMPORTO_COMPLESSIVO_GARA") or bando.get("IMPORTO_LOTTO")
+    cig = bando.get("CIG", "")
+
+    return {
+        "cig": cig,
+        "oggetto": bando.get("OGGETTO_GARA") or bando.get("OGGETTO_LOTTO", ""),
+        "importo_complessivo": float(importo) if importo else None,
+        "importo_sicurezza": bando.get("IMPORTO_SICUREZZA"),
+        "stazione_appaltante": sa.get("DENOMINAZIONE_AMMINISTRAZIONE_APPALTANTE", ""),
+        "cf_stazione_appaltante": sa.get("CF_AMMINISTRAZIONE_APPALTANTE", ""),
+        "comune": sa.get("CITTA", ""),
+        "regione": sa.get("REGIONE", ""),
+        "nuts": bando.get("LUOGO_NUTS", ""),
+        "istat_luogo": bando.get("LUOGO_ISTAT", ""),
+        "cpv": cpv_code,
+        "cpv_descrizione": cpv_desc,
+        "procedura": bando.get("TIPO_SCELTA_CONTRAENTE", ""),
+        "tipo_contratto": bando.get("OGGETTO_PRINCIPALE_CONTRATTO", ""),
+        "modalita_realizzazione": bando.get("MODALITA_REALIZZAZIONE", ""),
+        "esito": bando.get("ESITO", ""),
+        "stato": bando.get("STATO", ""),
+        "pnrr": bool(bando.get("FLAG_PNRR_PNC")),
+        "tipo_cig": bando.get("TIPO_CIG", ""),
+        "numero_gara": bando.get("NUMERO_GARA", ""),
+        "n_lotti": bando.get("N_LOTTI_COMPONENTI"),
+        "data_pubblicazione": pub.get("DATA_PUBBLICAZIONE", ""),
+        "data_scadenza_offerta": bando.get("DATA_SCADENZA_OFFERTA", ""),
+        "rup": rup_name,
+        "detail_url": DETAIL_URL_TEMPLATE.format(cig=cig),
+        "citation": CITATION,
+    }
+
+
 def get_contract_by_cig(cig: str) -> dict:
     """
-    Look up an Italian public contract by its CIG code.
+    Look up any Italian public contract by CIG code. Returns full details in ~2 seconds.
 
-    CIG (Codice Identificativo Gara) is the unique 10-character alphanumeric
-    identifier assigned by ANAC to every Italian public contract above €5.000.
+    Uses the ANAC SmartCIG API (api.anticorruzione.it/apicig) which covers ALL
+    contract types: ordinary, SmartCIG, PNRR, above and below EU thresholds.
 
-    LOOKUP ORDER (fastest first):
-    1. Instant scan of the in-memory cache (~3 most recent contracts)
-    2. API call to /releases/tender/{CIG} (15-30s, works ~30% of the time)
-    3. API call to /releases/{OCID} (15-30s, works ~20% of the time)
-    If not found, returns a direct link to the ANAC portal for manual lookup.
-
-    IMPORTANT: Most CIG codes will NOT be found via this API. The ANAC OCDS API
-    does not support CIG-based search. For reliable CIG lookup use the ANAC
-    portal directly: https://dati.anticorruzione.it/superset/dashboard/dettaglio_cig/
+    Returns: oggetto, importo, stazione appaltante (with CF, city, region),
+    CPV with description, procedure type, NUTS/ISTAT location, PNRR flag,
+    esito (award status), RUP name, publication date.
 
     args:
-        cig: The CIG code (10 alphanumeric chars, e.g. '918052266A').
+        cig: Any valid Italian CIG code (10 alphanumeric chars, e.g. 'B8A6086F77').
+             Case-insensitive.
 
     returns:
-        Contract record or structured error with portal link for manual lookup.
+        Full contract record, or structured error with ANAC portal link.
     """
     try:
         cig = cig.strip().upper()
-        if len(cig) < 3:
+        if len(cig) < 5:
             return {"error": "CIG non valido (troppo corto).", "cig": cig}
 
-        # Attempt 1 (instant): Scan the in-memory cache of recent releases.
-        # CIG is stored as items[0].id (lot identifier) in OCDS data.
-        cached_rels = _fetch_recent_releases(limit=3)
-        for rel in cached_rels:
-            for item in rel.get("tender", {}).get("items", []):
-                if item.get("id", "").strip().upper() == cig:
-                    contract = _parse_ocds_release(rel, cig_override=cig)
-                    contract = _enrich_with_price_delta(contract)
-                    contract["lookup_method"] = "cache_hit"
-                    contract["citation"] = CITATION
-                    return contract
+        data = _fetch_cig(cig)
+        if data:
+            return _parse_cig_response(data)
 
-        # Attempt 2 (slow, ~15-30s): CIG as direct tender ID
-        try:
-            releases = _fetch_releases_for_tender(cig)
-            if releases:
-                contract = _parse_ocds_release(releases[-1], cig_override=cig)
-                contract = _enrich_with_price_delta(contract)
-                contract["lookup_method"] = "tender_id_direct"
-                contract["citation"] = CITATION
-                return contract
-        except Exception:
-            pass
-
-        # Attempt 3 (slow, ~15-30s): OCID-based lookup
-        try:
-            ocid = f"{OCID_PREFIX}{cig}"
-            resp = _get(f"{OCDS_BASE}/releases/{ocid}", timeout=30.0)
-            if resp.status_code == 200 and not _is_waf_block(resp) and not _is_throttle(resp):
-                data = resp.json()
-                if isinstance(data, list) and data:
-                    contract = _parse_ocds_release(data[-1], cig_override=cig)
-                    contract = _enrich_with_price_delta(contract)
-                    contract["lookup_method"] = "ocid_lookup"
-                    contract["citation"] = CITATION
-                    return contract
-        except Exception:
-            pass
-
-        # Not found — return portal link (most CIG codes won't resolve via API)
         return {
-            "error": f"CIG '{cig}' non trovato nel campione API OCDS.",
+            "error": f"CIG '{cig}' non trovato.",
             "cig": cig,
             "detail_url": DETAIL_URL_TEMPLATE.format(cig=cig),
-            "hint": (
-                "Consulta il contratto direttamente sul portale ANAC tramite il link detail_url. "
-                "L'API OCDS non supporta ricerca per CIG — usa i CSV BDNCP per ricerche massive."
-            ),
+            "hint": "Verifica il codice CIG sul portale ANAC tramite il link detail_url.",
         }
 
     except Exception as e:

@@ -77,8 +77,8 @@ Use this to pick the right tool for each user request:
 
 2. "Cercami il CIG XXXXXXXXXX" / specific contract lookup
    → get_contract_by_cig(cig="...")
-   Checks cache first (instant). If not cached, tries 2 API calls (~30s each).
-   Most CIG codes will NOT be found — response includes ANAC portal link.
+   Calls ANAC SmartCIG API directly. Fast (~2s). Works for ALL CIG types.
+   Returns: oggetto, importo, stazione appaltante, CPV, NUTS, procedura, PNRR flag, RUP.
 
 3. "Analisi di mercato per..." / "affidamento diretto" / "quanto costa" / price benchmarks
    → benchmark_market_prices(procurement_description="...", importo_previsto=XXXXX, cpv_prefix="...")
