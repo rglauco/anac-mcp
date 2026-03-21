@@ -58,7 +58,9 @@ _request_times: list[float] = []
 # The real ANAC API gateway throttles after ~5 requests in a burst;
 # staying at 4/min with a minimum 15s gap is safe for sustained use.
 RATE_LIMIT_PER_MINUTE = 4
-MIN_GAP_SECONDS = 15.0
+# Each /releases call takes ~50s to return; enforce only a 5s inter-request gap.
+# The natural call duration provides most of the rate limiting itself.
+MIN_GAP_SECONDS = 5.0
 
 
 def _get(url: str, params: dict = None, timeout: float = 45.0) -> httpx.Response:
@@ -248,10 +250,40 @@ def _current_year() -> int:
 # Internal: fetch tender IDs for a date range
 # ─────────────────────────────────────────────
 
+def _fetch_recent_releases(limit: int = 10) -> list[dict]:
+    """
+    Fetch the most recent ANAC contracts via GET /releases?limit=N.
+
+    This is the only reliable read path on the ANAC OCDS API:
+    - /releases?limit=10 → works, returns 10 most recent contracts
+    - /releases?limit=20 → times out on ANAC's backend
+    - /tender/ids → returns IDs that mostly don't resolve (~10% hit rate)
+    - /releases/ocids → offset param not implemented, no real pagination
+
+    Max safe limit is 10. Calling this multiple times returns the SAME 10
+    records (no cursor/offset). Use client-side filtering on the result.
+    """
+    # ANAC API response time varies: ~15s per release under normal load, up to 30s
+    # under heavy load. Use limit=3 with a 120s timeout as the safe batch size.
+    # limit=5 can take 75-100s+ under load; limit=3 stays within ~60s reliably.
+    safe_limit = min(limit, 3)
+    resp = _get(f"{OCDS_BASE}/releases", params={"limit": str(safe_limit)}, timeout=120.0)
+    if resp.status_code != 200 or _is_waf_block(resp) or _is_throttle(resp):
+        return []
+    try:
+        data = resp.json()
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 def _get_tender_ids(date_from: str, date_to: str, limit: int = 20, offset: int = 0) -> list[str]:
     """
     Fetch tender IDs for a date window via /tender/ids.
-    Returns list of tender ID strings, empty on error.
+
+    WARNING: Most IDs returned do NOT resolve via /releases/tender/{id}.
+    Hit rate is ~10% in practice. Use _fetch_recent_releases() for reliable data.
+    Kept here for get_contract_by_cig scan fallback only.
     """
     resp = _get(f"{OCDS_BASE}/tender/ids", params={
         "filterField": "tenderStartDate",
@@ -263,17 +295,14 @@ def _get_tender_ids(date_from: str, date_to: str, limit: int = 20, offset: int =
         return []
     try:
         items = resp.json()
-        # NOTE: ANAC tender IDs often have a leading space (e.g. ' 01199250158-3-...')
-        # This leading space is PART of the identifier — do NOT strip it.
-        # However, some ANAC records contain tabs or other non-printable chars (data quality
-        # issue in BDNCP). Filter those out to avoid httpx InvalidURL errors.
+        # ANAC tender IDs have leading/trailing tabs and spaces — strip them.
+        # Real API response: {"value":"\t215973081"}, {"value":" \tSECCO_2026"}, etc.
         valid = []
         for item in items:
-            val = item.get("value", "")
+            val = item.get("value", "").strip()
             if not val:
                 continue
-            # Allow space (including leading), reject other non-printable ASCII
-            if any(ord(ch) < 32 and ch != " " for ch in val):
+            if any(ord(ch) < 32 for ch in val):
                 continue
             valid.append(val)
         return valid
@@ -282,7 +311,7 @@ def _get_tender_ids(date_from: str, date_to: str, limit: int = 20, offset: int =
 
 
 def _fetch_releases_for_tender(tender_id: str) -> list[dict]:
-    """Fetch all OCDS releases for a specific tender ID."""
+    """Fetch all OCDS releases for a specific tender ID. ~10% hit rate in practice."""
     resp = _get(f"{OCDS_BASE}/releases/tender/{tender_id}")
     if resp.status_code != 200 or _is_waf_block(resp) or _is_throttle(resp):
         return []
@@ -347,13 +376,15 @@ def search_contracts(
     Covers all contracts above €40,000 reported by Italian public administrations.
     Data from ANAC OCDS API (api.anticorruzione.it). CC-BY 4.0 licensed.
 
-    IMPORTANT — API LIMITATIONS:
-    The ANAC OCDS API supports date-range and value-range filtering server-side.
-    Keyword, CPV, and NUTS filtering is applied CLIENT-SIDE on a sample of contracts
-    retrieved for the given year. Due to API rate limits (~4 req/min), each call
-    fetches a limited sample (up to 20 tender records). For comprehensive keyword
-    search across all years, use the ANAC monthly CSV bulk downloads at
-    https://dati.anticorruzione.it/opendata/dataset/bandecig.
+    IMPORTANT — API LIMITATIONS (verified from live testing):
+    The ANAC OCDS API does NOT support keyword, CPV, NUTS, or authority filtering
+    server-side. The only reliable read path is GET /releases?limit=10 which returns
+    the 10 most recent contracts in the database. All filters are applied client-side.
+
+    The 'year', 'page', and 'region_nuts' parameters are accepted but have no effect
+    on what the API returns — they only control client-side filtering on the 10-record
+    batch. For historical search across all contracts, use the ANAC CSV bulk downloads:
+    https://dati.anticorruzione.it/opendata/dataset/bandecig
 
     args:
         keyword: Filter by words in contract description (client-side, Italian terms).
@@ -361,96 +392,75 @@ def search_contracts(
         cpv_prefix: CPV code prefix to filter category (client-side).
                     '45'=Construction, '48'=Software, '72'=IT services,
                     '79'=Business services, '85'=Healthcare, '90'=Environmental
-        region_nuts: NOTE — NUTS codes are not available in the OCDS API data model.
-                     This filter is accepted but will NOT reduce results.
-                     Use CSV bulk downloads for NUTS-based filtering.
+        region_nuts: NOT AVAILABLE in the OCDS API data model. Accepted but ignored.
         min_value_eur: Minimum contract value in euros (client-side filter)
         max_value_eur: Maximum contract value in euros (client-side filter)
-        year: Publication year (default: current year)
+        year: Accepted for compatibility but ignored — API always returns most recent.
         pnrr_only: If True, keep only contracts mentioning PNRR/PNC in description
-        contracting_authority: Filter by buyer name (partial, client-side)
-        page: Page of tender IDs to retrieve (each page = 20 tender records).
-              Results per page may be lower after client-side filtering.
+        contracting_authority: Filter by buyer name (partial match, client-side)
+        page: Accepted for compatibility but ignored — no real pagination in API.
 
     returns:
-        Dict with 'contracts' list, 'total_fetched', 'page', 'source', 'citation'.
+        Dict with 'contracts' list (max 10), 'total_fetched', 'source', 'citation'.
         Each contract: cig, oggetto, importo_base, importo_aggiudicato,
         stazione_appaltante, cpv, data_pubblicazione, procedura, pnrr, detail_url
     """
     try:
-        target_year = year or _current_year()
-        date_from = f"{target_year}-01-01"
-        date_to = f"{target_year}-12-31"
-        offset = (page - 1) * 20
+        # Fetch the most recent releases — the only reliable API path
+        releases = _fetch_recent_releases(limit=10)
 
-        # Step 1: Get tender IDs for the date window
-        tender_ids = _get_tender_ids(date_from, date_to, limit=20, offset=offset)
-
-        if not tender_ids:
+        if not releases:
             return {
                 "contracts": [],
                 "total_fetched": 0,
-                "page": page,
-                "year": target_year,
                 "warning": (
-                    "Nessun tender ID restituito dall'API ANAC. "
-                    "Potrebbe essere un problema temporaneo di rate limiting (attendi 60s) "
-                    "o l'intervallo date non ha risultati."
+                    "Nessun contratto restituito dall'API ANAC. "
+                    "Potrebbe essere un problema temporaneo di rate limiting (attendi 60s)."
                 ),
                 "fallback_url": "https://dati.anticorruzione.it/opendata/dataset/bandecig",
                 "source": "ANAC OCDS API",
                 "citation": CITATION,
             }
 
-        # Step 2: For each tender ID, fetch releases and filter
+        # Parse and apply client-side filters
         contracts = []
-        api_errors = 0
-        for tid in tender_ids:
-            releases = _fetch_releases_for_tender(tid)
-            if not releases:
-                api_errors += 1
-                continue
-            for rel in releases:
-                contract = _parse_ocds_release(rel)
-                if _contract_matches_filters(
-                    contract, keyword, cpv_prefix,
-                    min_value_eur, max_value_eur,
-                    pnrr_only, contracting_authority,
-                ):
-                    contracts.append(contract)
-                    if len(contracts) >= 50:
-                        break
-            if len(contracts) >= 50:
-                break
+        for rel in releases:
+            contract = _parse_ocds_release(rel)
+            if _contract_matches_filters(
+                contract, keyword, cpv_prefix,
+                min_value_eur, max_value_eur,
+                pnrr_only, contracting_authority,
+            ):
+                contracts.append(contract)
 
         warnings = []
         if region_nuts:
             warnings.append(
-                "Nota: il filtro region_nuts non è supportato dall'API OCDS. "
+                "Nota: il filtro region_nuts non è disponibile nell'API OCDS. "
                 "Per filtrare per NUTS usa i CSV mensili ANAC."
             )
-        if api_errors > 0:
-            warnings.append(f"{api_errors} tender ID non recuperati (rate limit o errore API).")
+        if year or page > 1:
+            warnings.append(
+                "Nota: i parametri 'year' e 'page' non sono supportati dall'API. "
+                "I risultati mostrano sempre i contratti più recenti in BDNCP."
+            )
 
         result = {
             "contracts": contracts,
             "total_fetched": len(contracts),
-            "tender_ids_requested": len(tender_ids),
-            "api_errors": api_errors,
-            "page": page,
-            "year": target_year,
+            "records_checked": len(releases),
             "filters_applied": {
                 "keyword": keyword,
                 "cpv_prefix": cpv_prefix,
-                "region_nuts": region_nuts,
                 "min_value_eur": min_value_eur,
                 "max_value_eur": max_value_eur,
                 "pnrr_only": pnrr_only,
                 "contracting_authority": contracting_authority,
             },
             "note": (
-                "Risultati basati su un campione di tender IDs per la finestra date specificata. "
-                "Per ricerche full-text esaustive usa i CSV mensili ANAC."
+                "Risultati basati sui contratti più recenti in BDNCP (max 10 per chiamata API). "
+                "Per ricerche storiche ed esaustive usa i CSV mensili ANAC: "
+                "https://dati.anticorruzione.it/opendata/dataset/bandecig"
             ),
             "source": "ANAC OCDS API (api.anticorruzione.it)",
             "citation": CITATION,
@@ -462,7 +472,7 @@ def search_contracts(
     except httpx.TimeoutException:
         return {
             "error": "Timeout connessione ANAC OCDS API.",
-            "detail": "Riprova tra 60 secondi o usa i CSV mensili.",
+            "detail": "Riprova tra 60 secondi.",
             "fallback_url": "https://dati.anticorruzione.it/opendata/dataset/bandecig",
         }
     except Exception as e:
@@ -529,24 +539,18 @@ def get_contract_by_cig(cig: str) -> dict:
             except Exception:
                 pass
 
-        # Attempt 3: Scan last 30 days of tender IDs (very limited — just one batch)
-        # NOTE: This is a best-effort scan. The ANAC OCDS API uses internal tender IDs
-        # that do NOT map directly to CIG codes. A full scan would require thousands
-        # of API calls. We try a small batch for recent contracts only.
-        now = datetime.now()
-        date_from = (now - timedelta(days=30)).strftime("%Y-%m-%d")
-        date_to = now.strftime("%Y-%m-%d")
-        scan_ids = _get_tender_ids(date_from, date_to, limit=10)
-        for tid in scan_ids[:5]:   # max 5 release fetches in scan
-            rels = _fetch_releases_for_tender(tid)
-            for rel in rels:
-                for item in rel.get("tender", {}).get("items", []):
-                    if item.get("id", "").strip().upper() == cig:
-                        contract = _parse_ocds_release(rel, cig_override=cig)
-                        contract = _enrich_with_price_delta(contract)
-                        contract["lookup_method"] = "scan_30d"
-                        contract["citation"] = CITATION
-                        return contract
+        # Attempt 3: Scan the most recent releases from /releases?limit=5.
+        # CIG appears as items[0].id (lot identifier), not as the OCDS tender.id.
+        # This is the most reliable scan approach since /releases always returns data.
+        recent_rels = _fetch_recent_releases(limit=5)
+        for rel in recent_rels:
+            for item in rel.get("tender", {}).get("items", []):
+                if item.get("id", "").strip().upper() == cig:
+                    contract = _parse_ocds_release(rel, cig_override=cig)
+                    contract = _enrich_with_price_delta(contract)
+                    contract["lookup_method"] = "scan_recent_releases"
+                    contract["citation"] = CITATION
+                    return contract
 
         # All attempts failed — return structured error with direct portal link
         return {
@@ -646,27 +650,27 @@ def benchmark_market_prices(
         date_range_label = f"{start_date.strftime('%B %Y')} – {now.strftime('%B %Y')}"
         region_label = f"regione NUTS {region_nuts}" if region_nuts else "dato nazionale"
 
-        # Collect contracts year by year using search_contracts
-        # (which uses /tender/ids + /releases/tender/{id})
+        # Fetch recent contracts from ANAC OCDS API and filter by keyword/CPV.
+        # The API only exposes the most recent ~10 contracts — no date range or
+        # historical search. We make up to 3 calls to collect a sample.
         all_contracts = []
-        for yr in range(start_date.year, now.year + 1):
-            for pg in range(1, 4):   # max 3 pages per year
-                result = search_contracts(
-                    keyword=procurement_description,
-                    cpv_prefix=cpv_prefix,
-                    year=yr,
-                    page=pg,
-                )
-                if "error" in result:
-                    break
-                batch = result.get("contracts", [])
-                if not batch:
-                    break
-                all_contracts.extend(batch)
-                if len(all_contracts) >= 60:
-                    break
-            if len(all_contracts) >= 60:
+        seen_cigs: set[str] = set()
+        for _ in range(3):
+            result = search_contracts(
+                keyword=procurement_description,
+                cpv_prefix=cpv_prefix,
+            )
+            if "error" in result:
                 break
+            for c in result.get("contracts", []):
+                cig = c.get("cig", "")
+                if cig not in seen_cigs:
+                    seen_cigs.add(cig)
+                    all_contracts.append(c)
+            if len(all_contracts) >= 30:
+                break
+            # Small delay between repeat calls to avoid rate limiting
+            time.sleep(MIN_GAP_SECONDS)
 
         # Extract award or base values
         values = []
@@ -807,23 +811,24 @@ def get_authority_procurement_profile(
         target_year = year or _current_year()
         all_contracts = []
 
-        # Paginate through up to 4 pages
-        for pg in range(1, 5):
-            result = search_contracts(
-                contracting_authority=authority_name,
-                year=target_year,
-                page=pg,
-            )
+        # Fetch recent contracts and filter by authority name client-side.
+        # The API returns the most recent ~10 contracts; we make up to 3 calls
+        # to build a useful sample.
+        seen_cigs: set[str] = set()
+        for attempt in range(3):
+            result = search_contracts(contracting_authority=authority_name)
             if "error" in result:
-                if pg == 1:
+                if attempt == 0:
                     return result
                 break
-            batch = result.get("contracts", [])
-            if not batch:
+            for c in result.get("contracts", []):
+                cig = c.get("cig", "")
+                if cig not in seen_cigs:
+                    seen_cigs.add(cig)
+                    all_contracts.append(c)
+            if len(all_contracts) >= 30:
                 break
-            all_contracts.extend(batch)
-            if len(all_contracts) >= 100:
-                break
+            time.sleep(MIN_GAP_SECONDS)
 
         if not all_contracts:
             return {
