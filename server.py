@@ -57,22 +57,53 @@ middleware = [
 
 mcp = FastMCP(
     name="ANAC Procurement Intelligence",
-    instructions="""Provides AI-powered access to Italy's national public procurement database (BDNCP) managed by ANAC (Autorità Nazionale Anticorruzione).
+    instructions="""Access Italy's national public procurement database (BDNCP) managed by ANAC.
+Data license: CC-BY 4.0. No credentials required.
 
-WHAT THIS SERVER ENABLES:
-- Market price benchmarking for any procurement category (analisi di mercato)
-- CIG code lookup and full contract lifecycle details
-- Contracting authority procurement profiling
-- Similar contract discovery for price validation
-- Pre-formatted analisi di mercato text ready for official documents
+== CRITICAL: DATA LIMITATIONS ==
+The ANAC OCDS API is extremely slow (~17 seconds per record). This server
+caches ~3 of the most recent contracts and serves them instantly. All tools
+operate on this small cached sample. Results are INDICATIVE, not exhaustive.
+For comprehensive research, direct users to ANAC CSV bulk downloads:
+https://dati.anticorruzione.it/opendata/dataset/bandecig
 
-DATA SOURCE: ANAC Banca Dati Nazionale Contratti Pubblici
-- Covers all Italian public contracts above €40,000
-- Updated in real-time via OCDS API
-- License: CC-BY 4.0 — all outputs are legally citable in official documents
-- No credentials required
+== TOOL ROUTING DECISION TREE ==
+Use this to pick the right tool for each user request:
 
-KEY USE CASE: When asked to prepare an 'analisi di mercato' for any procurement, use benchmark_market_prices() with a precise Italian description of what is being purchased. The output includes a ready-to-paste Italian paragraph for the official file.""",
+1. "Mostrami i contratti recenti" / "Cerca contratti" / general browsing
+   → search_contracts()
+   Returns ~3 most recent contracts. Filters are client-side.
+   Instant response (cached).
+
+2. "Cercami il CIG XXXXXXXXXX" / specific contract lookup
+   → get_contract_by_cig(cig="...")
+   Checks cache first (instant). If not cached, tries 2 API calls (~30s each).
+   Most CIG codes will NOT be found — response includes ANAC portal link.
+
+3. "Analisi di mercato per..." / "Quanto costa..." / price benchmarks
+   → benchmark_market_prices(procurement_description="...", cpv_prefix="...")
+   Use Italian procurement descriptions. Returns stats + paste-ready paragraph.
+   Based on ~3 cached contracts — always flag as "indicative" to the user.
+
+4. "Contratti di [ente]" / authority-specific queries
+   → get_authority_procurement_profile(authority_name="...")
+   Filters cache by buyer name. Will often return 0 results (expected).
+   Suggest ANAC portal as fallback.
+
+5. "Confronta CIG X con contratti simili"
+   → find_similar_contracts(reference_cig="...")
+   Compares a CIG against other cached contracts. Very small comparison pool.
+
+== COMMON PARAMETERS ==
+- cpv_prefix: 2-digit category code. '72'=IT, '45'=Construction, '48'=Software,
+  '79'=Business services, '85'=Healthcare, '90'=Environmental
+- keyword: Always use ITALIAN terms (e.g. 'servizi informatici' not 'IT services')
+
+== RESPONSE GUIDELINES ==
+- Always mention the sample size limitation to the user
+- Always include the ANAC citation from tool responses
+- If a tool returns 0 results, suggest CSV bulk downloads as alternative
+- If status="warming_up", tell user to wait 60-90 seconds and retry""",
     version="1.0.0",
     website_url="https://dati.anticorruzione.it",
 )
