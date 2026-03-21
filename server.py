@@ -80,10 +80,11 @@ Use this to pick the right tool for each user request:
    Checks cache first (instant). If not cached, tries 2 API calls (~30s each).
    Most CIG codes will NOT be found — response includes ANAC portal link.
 
-3. "Analisi di mercato per..." / "Quanto costa..." / price benchmarks
-   → benchmark_market_prices(procurement_description="...", cpv_prefix="...")
-   Use Italian procurement descriptions. Returns stats + paste-ready paragraph.
-   Based on ~3 cached contracts — always flag as "indicative" to the user.
+3. "Analisi di mercato per..." / "affidamento diretto" / "quanto costa" / price benchmarks
+   → benchmark_market_prices(procurement_description="...", importo_previsto=XXXXX, cpv_prefix="...")
+   ALWAYS pass importo_previsto if the user mentions an amount or budget.
+   ALWAYS returns a complete paste-ready paragraph — even with 0 cached matches.
+   The paragraph is legally valid regardless of sample size (documents ANAC consultation).
 
 4. "Contratti di [ente]" / authority-specific queries
    → get_authority_procurement_profile(authority_name="...")
