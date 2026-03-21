@@ -57,54 +57,58 @@ middleware = [
 
 mcp = FastMCP(
     name="ANAC Procurement Intelligence",
-    instructions="""Access Italy's national public procurement database (BDNCP) managed by ANAC.
-Data license: CC-BY 4.0. No credentials required.
+    instructions="""Accesso alla Banca Dati Nazionale Contratti Pubblici (BDNCP) gestita da ANAC.
+Dati pubblici, licenza CC-BY-SA 4.0. Nessuna credenziale richiesta.
 
-== CRITICAL: DATA LIMITATIONS ==
-The ANAC OCDS API is extremely slow (~17 seconds per record). This server
-caches ~3 of the most recent contracts and serves them instantly. All tools
-operate on this small cached sample. Results are INDICATIVE, not exhaustive.
-For comprehensive research, direct users to ANAC CSV bulk downloads:
-https://dati.anticorruzione.it/opendata/dataset/bandecig
+== CAPACITÀ REALI DEL SERVER ==
+Il server scarica i dati CSV mensili di ANAC (decine di migliaia di contratti per mese)
+e li carica in un database DuckDB in-memory. Tutti gli strumenti eseguono query SQL
+con risposte in meno di 1 secondo. Copertura: ultimi 3–12 mesi.
 
-== TOOL ROUTING DECISION TREE ==
-Use this to pick the right tool for each user request:
+Al primo avvio il database impiega 2–3 minuti a caricarsi. Se lo stato è "initializing"
+o "loading", comunica all'utente di riprovare tra 60 secondi.
 
-1. "Mostrami i contratti recenti" / "Cerca contratti" / general browsing
-   → search_contracts()
-   Returns ~3 most recent contracts. Filters are client-side.
-   Instant response (cached).
+== DECISION TREE: quale strumento usare ==
 
-2. "Cercami il CIG XXXXXXXXXX" / specific contract lookup
-   → get_contract_by_cig(cig="...")
-   Calls ANAC SmartCIG API directly. Fast (~2s). Works for ALL CIG types.
-   Returns: oggetto, importo, stazione appaltante, CPV, NUTS, procedura, PNRR flag, RUP.
+1. Cercare contratti (per keyword, CPV, regione, importo, procedura, stato)
+   → search_contracts(keyword=..., cpv_prefix=..., region=..., importo_min=..., importo_max=...)
+   PRIMO strumento da chiamare per qualsiasi ricerca di contratti.
+   Restituisce fino a 25 contratti con tutti i dettagli, ordinati per data.
+   SEMPRE usare termini italiani per keyword (es. 'servizi informatici', non 'IT services').
 
-3. "Analisi di mercato per..." / "affidamento diretto" / "quanto costa" / price benchmarks
-   → benchmark_market_prices(procurement_description="...", importo_previsto=XXXXX, cpv_prefix="...")
-   ALWAYS pass importo_previsto if the user mentions an amount or budget.
-   ALWAYS returns a complete paste-ready paragraph — even with 0 cached matches.
-   The paragraph is legally valid regardless of sample size (documents ANAC consultation).
+2. Cercare un CIG specifico
+   → get_contract_by_cig(cig="XXXXXXXXXX")
+   Lookup diretto per codice CIG (10 caratteri alfanumerici).
+   Include dati dell'ente dall'anagrafica ANAC (tipo, provincia, città).
 
-4. "Contratti di [ente]" / authority-specific queries
-   → get_authority_procurement_profile(authority_name="...")
-   Filters cache by buyer name. Will often return 0 results (expected).
-   Suggest ANAC portal as fallback.
+3. Analisi di mercato / benchmark prezzi / congruità importo
+   → benchmark_market_prices(procurement_description=..., importo_previsto=..., cpv_prefix=...)
+   SEMPRE passare importo_previsto se l'utente menziona un budget o importo.
+   Restituisce SEMPRE un paragrafo completo pronto per il fascicolo,
+   conforme all'art. 14 D.Lgs. 36/2023, anche con campione piccolo.
+   Il paragrafo è legalmente valido: documenta la consultazione ANAC.
 
-5. "Confronta CIG X con contratti simili"
-   → find_similar_contracts(reference_cig="...")
-   Compares a CIG against other cached contracts. Very small comparison pool.
+4. Profilo acquisti di un ente
+   → get_authority_procurement_profile(authority_name=...) o (codice_fiscale=...)
+   Statistiche complete: n. contratti, valore totale/medio, top CPV, procedure usate,
+   ultimi 10 contratti. Funziona con nome parziale (es. 'Comune di Roma').
 
-== COMMON PARAMETERS ==
-- cpv_prefix: 2-digit category code. '72'=IT, '45'=Construction, '48'=Software,
-  '79'=Business services, '85'=Healthcare, '90'=Environmental
-- keyword: Always use ITALIAN terms (e.g. 'servizi informatici' not 'IT services')
+5. Trovare contratti simili per comparazione
+   → find_similar_contracts(procurement_description=..., cpv_prefix=..., importo_riferimento=...)
+   Ordinati per prossimità a importo_riferimento se fornito.
+   Utile per costruire la base evidenziale dell'analisi di mercato.
 
-== RESPONSE GUIDELINES ==
-- Always mention the sample size limitation to the user
-- Always include the ANAC citation from tool responses
-- If a tool returns 0 results, suggest CSV bulk downloads as alternative
-- If status="warming_up", tell user to wait 60-90 seconds and retry""",
+== PARAMETRI CHIAVE ==
+cpv_prefix (2+ cifre): '45'=Costruzione, '48'=Software, '72'=Servizi IT,
+  '79'=Servizi aziendali, '85'=Sanità, '90'=Ambiente/Pulizia
+region: nome regione italiana (es. 'Campania', 'Lombardia', 'Lazio')
+tipo_procedura: 'AFFIDAMENTO DIRETTO', 'PROCEDURA APERTA', 'PROCEDURA NEGOZIATA'
+
+== LINEE GUIDA RISPOSTE ==
+- Includere sempre la copertura temporale (campo coverage.months_loaded)
+- Includere sempre la citazione ANAC dal campo citation
+- Se total_matching > returned, suggerire filtri più specifici
+- Per dati storici oltre i 12 mesi: https://dati.anticorruzione.it/opendata/dataset/cig""",
     version="1.0.0",
     website_url="https://dati.anticorruzione.it",
 )

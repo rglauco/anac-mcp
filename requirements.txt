@@ -3,3 +3,4 @@ httpx
 python-dotenv
 uvicorn
 mcp
+duckdb

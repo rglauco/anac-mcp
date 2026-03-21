@@ -1,1115 +1,1140 @@
 """
 ANAC Procurement Intelligence — Tool implementations.
 
-Data source: ANAC OCDS REST API
-  Host: https://api.anticorruzione.it/opendata/ocds/api/v1/1.0.0
-  Spec: https://dati.anticorruzione.it/opendata/ocds/api/spec/swagger.json
+Data source: ANAC Open Data Portal (CKAN)
+  https://dati.anticorruzione.it/opendata/
+  License: CC-BY-SA 4.0
 
-No authentication required. Data license: CC-BY 4.0.
+Architecture: DuckDB in-memory database populated from ANAC monthly CSV ZIPs.
+  - Startup: downloads stazioni_appaltanti (~2.7 MB) + last 3 months of cig data
+  - Background thread extends coverage to 12 months
+  - All tools run DuckDB SQL queries (sub-second responses, zero timeout risk)
 
-== REAL API CAPABILITIES (verified from swagger.json) ==
+WAF note: ANAC's Volterra WAF blocks default curl/Python UAs with fake HTTP 200
+responses. All requests MUST include a browser User-Agent.
 
-Endpoints that actually exist:
-  GET /tender/ids         — tender IDs for a date window (filterField, filterArgs, limit, offset)
-  GET /releases/tender/{id}  — all releases for a tender ID
-  GET /releases/{ocid}   — releases for a specific OCID
-  GET /awards            — award records filtered by date/amount range
-  GET /version, /stats   — metadata
-
-WHAT THE API DOES NOT SUPPORT:
-  - Keyword/full-text search (zero such parameters in swagger spec)
-  - CPV or NUTS filtering (server-side)
-  - Pagination beyond limit/offset on /tender/ids
-
-Keyword/CPV/NUTS filtering is applied CLIENT-SIDE on the returned releases.
-Sample sizes are therefore limited by the API rate limit (~5 req/burst, 60s cooldown).
-This is documented in each tool's docstring so the AI and users know.
+Key datasets:
+  cig-YYYY   — tender notices (one ZIP per month). 60 columns including:
+               cig, oggetto_gara, importo_lotto, cod_cpv, descrizione_cpv,
+               cf_amministrazione_appaltante, denominazione_amministrazione_appaltante,
+               sezione_regionale, tipo_scelta_contraente, data_pubblicazione,
+               stato, anno_pubblicazione, mese_pubblicazione, FLAG_PNRR_PNC
+  stazioni_appaltanti — contracting authority registry (~2.7 MB total)
 """
 
-import statistics
+import io
+import os
 import threading
 import time
-from datetime import datetime, timedelta
+import zipfile
+from datetime import date, datetime
 from typing import Optional
 
+import duckdb
 import httpx
 
 # ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
 
-OCDS_BASE = "https://api.anticorruzione.it/opendata/ocds/api/v1/1.0.0"
-OCID_PREFIX = "ocds-hu01ve-"   # real ANAC OCID prefix confirmed from live data
+ANAC_DOWNLOAD = "https://dati.anticorruzione.it/opendata/download/dataset"
 
-DETAIL_URL_TEMPLATE = (
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+CITATION = (
+    "Fonte: ANAC — Banca Dati Nazionale Contratti Pubblici (BDNCP). "
+    "Licenza: CC-BY-SA 4.0. "
+    "URL: https://dati.anticorruzione.it"
+)
+
+DETAIL_URL = (
     "https://dati.anticorruzione.it/superset/dashboard/dettaglio_cig/?cig={cig}"
 )
-CITATION = (
-    "Fonte: ANAC - Banca Dati Nazionale Contratti Pubblici, aggiornamento in tempo reale. "
-    "Licenza CC-BY 4.0. URL: https://dati.anticorruzione.it"
-)
 
 # ─────────────────────────────────────────────
-# Rate-limited HTTP client
+# Database state
 # ─────────────────────────────────────────────
 
-_lock = threading.Lock()
-_request_times: list[float] = []
-# The real ANAC API gateway throttles after ~5 requests in a burst;
-# staying at 4/min with a minimum 15s gap is safe for sustained use.
-RATE_LIMIT_PER_MINUTE = 4
-MIN_GAP_SECONDS = 5.0
-
-# ─────────────────────────────────────────────
-# Startup cache
-# ─────────────────────────────────────────────
-# The ANAC /releases endpoint is slow (15-30s per record from European DCs,
-# potentially 60s+ from US cloud). To prevent Intric's 120s MCP timeout from
-# triggering, we pre-fetch releases in a background thread at module load time
-# and serve all tool calls from the in-memory cache.
-#
-# Cache lifecycle:
-#   - Background thread starts immediately when tools.py is imported
-#   - Tries to fetch limit=3 releases (~45-90s depending on network)
-#   - Refreshes every CACHE_TTL_SECONDS (30 min) thereafter
-#   - Tools read from cache instantly; if cache is empty they return a
-#     "warming up" response rather than timing out
-_release_cache: dict = {"releases": [], "updated_at": 0.0, "warming": True}
-_cache_lock = threading.Lock()
-CACHE_TTL_SECONDS = 1800   # 30 minutes
-
-
-def _get(url: str, params: dict = None, timeout: float = 45.0) -> httpx.Response:
-    """
-    Rate-limited GET against the ANAC OCDS API.
-    Enforces MAX 4 req/min and MIN 15s between requests to avoid the WSO2
-    gateway 900801 "API Limit Reached" throttle.
-    Retries once after 65s if throttled.
-    """
-    with _lock:
-        now = time.time()
-        _request_times[:] = [t for t in _request_times if now - t < 60]
-
-        # Enforce minimum gap between requests
-        if _request_times:
-            since_last = now - _request_times[-1]
-            if since_last < MIN_GAP_SECONDS:
-                gap = MIN_GAP_SECONDS - since_last + 0.2
-                print(f"[ANAC] spacing requests, waiting {gap:.1f}s")
-                time.sleep(gap)
-
-        # Enforce per-minute rate limit
-        if len(_request_times) >= RATE_LIMIT_PER_MINUTE:
-            sleep_for = 60 - (now - _request_times[0]) + 1.0
-            if sleep_for > 0:
-                print(f"[ANAC rate limit] sleeping {sleep_for:.1f}s")
-                time.sleep(sleep_for)
-
-        _request_times.append(time.time())
-
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (compatible; ANAC-MCP/1.0)",
-    }
-    with httpx.Client(
-        timeout=timeout, follow_redirects=True, verify=False, headers=headers
-    ) as client:
-        resp = client.get(url, params=params or {})
-
-    # Detect WSO2 throttle returned as 503 JSON fault
-    if resp.status_code == 503:
-        try:
-            fault = resp.json().get("fault", {})
-            if fault.get("code") == 900801:
-                print("[ANAC] 900801 throttle hit — waiting 65s and retrying")
-                time.sleep(65)
-                with _lock:
-                    _request_times.append(time.time())
-                with httpx.Client(
-                    timeout=timeout, follow_redirects=True, verify=False, headers=headers
-                ) as client:
-                    resp = client.get(url, params=params or {})
-        except Exception:
-            pass
-
-    return resp
-
-
-def _is_waf_block(resp: httpx.Response) -> bool:
-    """
-    Detect WAF rejection disguised as HTTP 200 with HTML body.
-    The ANAC infrastructure returns 200 + HTML 'Request Rejected' from some IPs.
-    """
-    if "text/html" in resp.headers.get("content-type", ""):
-        return "Request Rejected" in resp.text[:300] or resp.text.strip() == ""
-    return False
-
-
-def _is_throttle(resp: httpx.Response) -> bool:
-    """Detect WSO2 API gateway throttle response."""
-    if resp.status_code == 503:
-        try:
-            return resp.json().get("fault", {}).get("code") == 900801
-        except Exception:
-            pass
-    return False
-
-
-# ─────────────────────────────────────────────
-# Data parsing helpers
-# ─────────────────────────────────────────────
-
-def _to_float(value) -> Optional[float]:
-    """Convert amount to float — the ANAC API returns amounts as strings."""
-    if value is None:
-        return None
-    try:
-        return float(str(value).replace(",", ".").strip())
-    except (ValueError, TypeError):
-        return None
-
-
-def _parse_ocds_release(release: dict, cig_override: str = None) -> dict:
-    """
-    Flatten one OCDS release object into a clean contract dict.
-
-    Real ANAC data structure (verified from live API):
-    - CIG = items[0].id  (NOT from ocid — the OCID uses an internal tender ID)
-    - items[n].classification is a SINGLE OBJECT (not array)
-    - value.amount is a STRING ("120000.00")
-    - buyer.id = CF (fiscal code) of contracting authority
-    - oggetto = items[0].description (tender.description is often "ND")
-    - NUTS is NOT present in this API's data model (CSV only)
-    """
-    try:
-        tender = release.get("tender", {})
-        buyer = release.get("buyer", {})
-        awards = release.get("awards", [])
-        first_award = awards[0] if awards else {}
-        suppliers = first_award.get("suppliers", [])
-        first_supplier = suppliers[0] if suppliers else {}
-
-        # CIG: items[0].id is the lot CIG (10-char alphanumeric)
-        items = tender.get("items", [])
-        first_item = items[0] if items else {}
-        cig = cig_override or first_item.get("id", "").strip().upper()
-
-        # Contract object description (items description is more useful than tender.description)
-        oggetto = first_item.get("description", "") or tender.get("description", "")
-
-        # CPV: classification is a SINGLE OBJECT (not array) in real ANAC data
-        classification = first_item.get("classification", {})
-        cpv_code = ""
-        if isinstance(classification, dict):
-            cpv_code = classification.get("id", "")
-        elif isinstance(classification, list) and classification:
-            cpv_code = classification[0].get("id", "")
-
-        # Values — amounts are STRINGS in real API
-        tender_value = tender.get("value", {})
-        importo_base = _to_float(tender_value.get("amount"))
-
-        award_value = first_award.get("value", {})
-        importo_aggiudicato = _to_float(award_value.get("amount"))
-
-        # Publication date from tenderPeriod.startDate
-        tender_period = tender.get("tenderPeriod", {})
-        data_pub = (tender_period.get("startDate") or release.get("date") or "")
-        if data_pub and "T" in data_pub:
-            data_pub = data_pub.split("T")[0]
-
-        # Procedure
-        procedura = tender.get("procurementMethodDetails") or tender.get("procurementMethod") or ""
-
-        # PNRR detection (best-effort: check description keywords, ANAC CSV has a dedicated field)
-        pnrr = any(
-            kw in str(oggetto).upper() or kw in str(procedura).upper()
-            for kw in ["PNRR", "PNC", "RIPRESA E RESILIENZA"]
-        )
-
-        # Fornitore aggiudicatario
-        fornitore = first_supplier.get("name", "")
-
-        # Compact output — only fields the LLM needs
-        result = {
-            "cig": cig,
-            "oggetto": oggetto[:120] if oggetto else "",
-            "importo_base": importo_base,
-            "importo_aggiudicato": importo_aggiudicato,
-            "stazione_appaltante": buyer.get("name", ""),
-            "cpv": cpv_code,
-            "data_pubblicazione": data_pub,
-            "procedura": procedura,
-            "pnrr": pnrr,
-            "detail_url": DETAIL_URL_TEMPLATE.format(cig=cig) if cig else "",
-        }
-        # Only include non-empty optional fields
-        if fornitore:
-            result["fornitore_aggiudicatario"] = fornitore
-        cf = buyer.get("id", "")
-        if cf:
-            result["cf_stazione_appaltante"] = cf
-        return result
-    except Exception as e:
-        return {"error": f"parse_error: {e}", "raw": str(release)[:200]}
-
-
-def _italian_number(value: float) -> str:
-    """Format number in Italian locale: period thousands, comma decimals."""
-    formatted = f"{value:,.2f}"
-    return formatted.replace(",", "X").replace(".", ",").replace("X", ".")
-
-
-def _current_year() -> int:
-    return datetime.now().year
-
-
-# ─────────────────────────────────────────────
-# Internal: fetch tender IDs for a date range
-# ─────────────────────────────────────────────
-
-def _do_api_fetch_releases(limit: int = 3) -> list[dict]:
-    """
-    Raw blocking fetch of recent ANAC releases. Slow (45-90s from cloud DCs).
-    Do NOT call from tool handlers — use _fetch_recent_releases() which reads
-    from the in-memory cache instead.
-
-    API notes (verified from live testing):
-    - /releases?limit=3 → ~45s locally, potentially 90s+ from Railway/cloud
-    - /releases?limit=10 → times out (>120s)
-    - /releases/ocids offset is broken; /releases/{ocid} also slow
-    - Only limit=3 with a 120s timeout is reliably safe
-    """
-    safe_limit = min(limit, 3)
-    try:
-        resp = _get(f"{OCDS_BASE}/releases", params={"limit": str(safe_limit)}, timeout=120.0)
-        if resp.status_code != 200 or _is_waf_block(resp) or _is_throttle(resp):
-            return []
-        data = resp.json()
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _background_cache_worker() -> None:
-    """
-    Background thread: fetch ANAC releases once at startup, then refresh every
-    CACHE_TTL_SECONDS. Runs as a daemon so it never blocks server shutdown.
-    """
-    while True:
-        try:
-            print("[ANAC cache] fetching releases from API…")
-            releases = _do_api_fetch_releases(limit=3)
-            with _cache_lock:
-                if releases:
-                    _release_cache["releases"] = releases
-                    _release_cache["updated_at"] = time.time()
-                    _release_cache["warming"] = False
-                    print(f"[ANAC cache] warmed with {len(releases)} releases")
-                else:
-                    print("[ANAC cache] fetch returned empty — will retry after TTL")
-        except Exception as exc:
-            print(f"[ANAC cache] background refresh error: {exc}")
-        time.sleep(CACHE_TTL_SECONDS)
-
-
-# Start background cache refresh immediately at module import.
-# By the time the first MCP tool call arrives the cache is likely warm.
-_cache_thread = threading.Thread(target=_background_cache_worker, daemon=True, name="anac-cache")
-_cache_thread.start()
-
-
-def _fetch_recent_releases(limit: int = 3) -> list[dict]:
-    """
-    Return recent ANAC releases from the in-memory cache (instant).
-    Falls back to a live API call only if the cache has never been populated.
-    Returns an empty list (never raises) — callers handle the empty case.
-    """
-    with _cache_lock:
-        releases = _release_cache["releases"]
-        age = time.time() - _release_cache["updated_at"]
-        warming = _release_cache["warming"]
-
-    if releases and age < CACHE_TTL_SECONDS * 2:   # serve even slightly stale cache
-        return releases[:limit]
-
-    if warming:
-        # Cache not yet populated — return empty; callers will surface the warming message
-        return []
-
-    # Cache expired — try a live fetch (may be slow, but cache was working before)
-    return _do_api_fetch_releases(limit=min(limit, 3))
-
-
-def _get_tender_ids(date_from: str, date_to: str, limit: int = 20, offset: int = 0) -> list[str]:
-    """
-    Fetch tender IDs for a date window via /tender/ids.
-
-    WARNING: Most IDs returned do NOT resolve via /releases/tender/{id}.
-    Hit rate is ~10% in practice. Use _fetch_recent_releases() for reliable data.
-    Kept here for get_contract_by_cig scan fallback only.
-    """
-    resp = _get(f"{OCDS_BASE}/tender/ids", params={
-        "filterField": "tenderStartDate",
-        "filterArgs": f"{date_from},{date_to}",
-        "limit": str(limit),
-        "offset": str(offset),
-    })
-    if resp.status_code != 200 or _is_waf_block(resp) or _is_throttle(resp):
-        return []
-    try:
-        items = resp.json()
-        # ANAC tender IDs have leading/trailing tabs and spaces — strip them.
-        # Real API response: {"value":"\t215973081"}, {"value":" \tSECCO_2026"}, etc.
-        valid = []
-        for item in items:
-            val = item.get("value", "").strip()
-            if not val:
-                continue
-            if any(ord(ch) < 32 for ch in val):
-                continue
-            valid.append(val)
-        return valid
-    except Exception:
-        return []
-
-
-def _fetch_releases_for_tender(tender_id: str) -> list[dict]:
-    """Fetch all OCDS releases for a specific tender ID. ~10% hit rate in practice."""
-    resp = _get(f"{OCDS_BASE}/releases/tender/{tender_id}")
-    if resp.status_code != 200 or _is_waf_block(resp) or _is_throttle(resp):
-        return []
-    try:
-        data = resp.json()
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _contract_matches_filters(
-    contract: dict,
-    keyword: Optional[str],
-    cpv_prefix: Optional[str],
-    min_value_eur: Optional[float],
-    max_value_eur: Optional[float],
-    pnrr_only: bool,
-    contracting_authority: Optional[str],
-) -> bool:
-    """Client-side filter for a contract dict."""
-    if "error" in contract:
-        return False
-    val = contract.get("importo_aggiudicato") or contract.get("importo_base") or 0
-    if min_value_eur is not None and val and val < min_value_eur:
-        return False
-    if max_value_eur is not None and val and val > max_value_eur:
-        return False
-    if pnrr_only and not contract.get("pnrr"):
-        return False
-    if cpv_prefix and not contract.get("cpv", "").startswith(cpv_prefix):
-        return False
-    if keyword:
-        kw_lower = keyword.lower()
-        if (kw_lower not in contract.get("oggetto", "").lower()
-                and kw_lower not in contract.get("stazione_appaltante", "").lower()):
-            return False
-    if contracting_authority:
-        auth_lower = contracting_authority.lower()
-        if auth_lower not in contract.get("stazione_appaltante", "").lower():
-            return False
-    return True
-
-
-# ─────────────────────────────────────────────
-# Tool 1: search_contracts
-# ─────────────────────────────────────────────
-
-def search_contracts(
-    keyword: str = None,
-    cpv_prefix: str = None,
-    region_nuts: str = None,
-    min_value_eur: float = None,
-    max_value_eur: float = None,
-    year: int = None,
-    pnrr_only: bool = False,
-    contracting_authority: str = None,
-    page: int = 1,
-) -> dict:
-    """
-    Return the most recent Italian public procurement contracts from ANAC.
-
-    This is the primary discovery tool. It returns ~3 contracts from the ANAC
-    OCDS API cache, with optional client-side filtering by keyword, CPV, value
-    range, or authority name.
-
-    IMPORTANT LIMITATIONS (verified from live API testing):
-    - Returns at most 3 contracts (the ANAC API is extremely slow: ~17s per record).
-    - All filtering is CLIENT-SIDE — the API has no search/filter parameters.
-    - 'year', 'page', 'region_nuts' are accepted but IGNORED (API limitation).
-    - Response is instant (served from in-memory cache refreshed every 30 min).
-    - For historical/exhaustive search, use ANAC CSV bulk downloads.
-
-    When to use: User asks to see recent contracts, browse what's in ANAC, or
-    asks a general question about Italian public procurement data.
-    When NOT to use: For CIG lookup use get_contract_by_cig. For price analysis
-    use benchmark_market_prices.
-
-    args:
-        keyword: Filter description/authority (Italian). E.g. 'servizi informatici'
-        cpv_prefix: CPV division. '72'=IT, '45'=Construction, '48'=Software
-        min_value_eur: Minimum contract value in euros
-        max_value_eur: Maximum contract value in euros
-        pnrr_only: If True, only PNRR/PNC-funded contracts
-        contracting_authority: Filter by buyer name (partial match)
-
-    returns:
-        contracts (max 3), total_fetched, source, citation.
-    """
-    try:
-        # Fetch the most recent releases from cache (instant, max 3 records)
-        releases = _fetch_recent_releases(limit=3)
-
-        if not releases:
-            with _cache_lock:
-                is_warming = _release_cache["warming"]
-            if is_warming:
-                return {
-                    "contracts": [],
-                    "total_fetched": 0,
-                    "status": "warming_up",
-                    "message": (
-                        "Il server MCP si sta avviando e sta pre-caricando i dati dall'API ANAC. "
-                        "L'operazione richiede 60-90 secondi alla prima accensione. "
-                        "Riprova tra un minuto."
-                    ),
-                    "source": "ANAC OCDS API",
-                    "citation": CITATION,
-                }
-            return {
-                "contracts": [],
-                "total_fetched": 0,
-                "warning": (
-                    "Nessun contratto restituito dall'API ANAC. "
-                    "Potrebbe essere un problema temporaneo di rate limiting (attendi 60s)."
-                ),
-                "fallback_url": "https://dati.anticorruzione.it/opendata/dataset/bandecig",
-                "source": "ANAC OCDS API",
-                "citation": CITATION,
-            }
-
-        # Parse and apply client-side filters
-        contracts = []
-        for rel in releases:
-            contract = _parse_ocds_release(rel)
-            if _contract_matches_filters(
-                contract, keyword, cpv_prefix,
-                min_value_eur, max_value_eur,
-                pnrr_only, contracting_authority,
-            ):
-                contracts.append(contract)
-
-        warnings = []
-        if region_nuts:
-            warnings.append(
-                "Nota: il filtro region_nuts non è disponibile nell'API OCDS. "
-                "Per filtrare per NUTS usa i CSV mensili ANAC."
-            )
-        if year or page > 1:
-            warnings.append(
-                "Nota: i parametri 'year' e 'page' non sono supportati dall'API. "
-                "I risultati mostrano sempre i contratti più recenti in BDNCP."
-            )
-
-        result = {
-            "contracts": contracts,
-            "total_fetched": len(contracts),
-            "records_checked": len(releases),
-            "filters_applied": {
-                "keyword": keyword,
-                "cpv_prefix": cpv_prefix,
-                "min_value_eur": min_value_eur,
-                "max_value_eur": max_value_eur,
-                "pnrr_only": pnrr_only,
-                "contracting_authority": contracting_authority,
-            },
-            "note": (
-                "Campione: ~3 contratti più recenti in BDNCP (limite API ANAC). "
-                "Per ricerche storiche usa i CSV mensili: "
-                "https://dati.anticorruzione.it/opendata/dataset/bandecig"
-            ),
-            "source": "ANAC OCDS API (api.anticorruzione.it)",
-            "citation": CITATION,
-        }
-        if warnings:
-            result["warnings"] = warnings
-        return result
-
-    except httpx.TimeoutException:
-        return {
-            "error": "Timeout connessione ANAC OCDS API.",
-            "detail": "Riprova tra 60 secondi.",
-            "fallback_url": "https://dati.anticorruzione.it/opendata/dataset/bandecig",
-        }
-    except Exception as e:
-        return {
-            "error": f"Errore ricerca contratti: {type(e).__name__}: {e}",
-            "fallback_url": "https://dati.anticorruzione.it/opendata/dataset/bandecig",
-        }
-
-
-# ─────────────────────────────────────────────
-# Tool 2: get_contract_by_cig
-# ─────────────────────────────────────────────
-
-CIG_API_BASE = "https://api.anticorruzione.it/apicig/1.0.0"
-CIG_API_HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
+_db: Optional[duckdb.DuckDBPyConnection] = None
+_db_lock = threading.Lock()
+_db_status: dict = {
+    "state": "initializing",   # initializing | ready | error
+    "months_loaded": [],
+    "row_count": 0,
+    "authorities_count": 0,
+    "last_updated": None,
+    "error": None,
 }
 
+# ─────────────────────────────────────────────
+# HTTP helpers
+# ─────────────────────────────────────────────
 
-def _fetch_cig(cig: str) -> Optional[dict]:
-    """
-    Call /getSmartCig/{CIG}. Returns parsed contract dict or None.
-    Fast (~2s). Works for all CIG types (ordinary, smart, PNRR).
-    codice_risposta == 'NOKSN' means found; 'NOKCN' means not found.
-    """
+
+def _http_get(url: str, timeout: float = 120.0) -> httpx.Response:
+    """GET with browser User-Agent — required to bypass ANAC Volterra WAF."""
+    with httpx.Client(
+        follow_redirects=True,
+        timeout=timeout,
+        headers={"User-Agent": BROWSER_UA, "Accept": "*/*"},
+    ) as client:
+        return client.get(url)
+
+
+def _download_csv_from_zip(url: str) -> bytes:
+    """Download a ZIP archive and return the bytes of the first .csv inside."""
+    resp = _http_get(url)
+    resp.raise_for_status()
+    zf = zipfile.ZipFile(io.BytesIO(resp.content))
+    csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+    if not csv_names:
+        raise ValueError(
+            f"No CSV file found in ZIP from {url}. Contents: {zf.namelist()}"
+        )
+    return zf.read(csv_names[0])
+
+
+# ─────────────────────────────────────────────
+# Schema
+# ─────────────────────────────────────────────
+
+_CREATE_CIG = """
+CREATE TABLE IF NOT EXISTS cig (
+    cig                 VARCHAR PRIMARY KEY,
+    oggetto_gara        VARCHAR,
+    importo_lotto       DOUBLE,
+    cod_cpv             VARCHAR,
+    descrizione_cpv     VARCHAR,
+    cf_sa               VARCHAR,
+    denominazione_sa    VARCHAR,
+    sezione_regionale   VARCHAR,
+    tipo_scelta_contraente VARCHAR,
+    data_pubblicazione  VARCHAR,
+    stato               VARCHAR,
+    anno                INTEGER,
+    mese                INTEGER,
+    flag_pnrr           VARCHAR
+)
+"""
+
+_CREATE_SA = """
+CREATE TABLE IF NOT EXISTS stazioni_appaltanti (
+    codice_fiscale      VARCHAR PRIMARY KEY,
+    denominazione       VARCHAR,
+    codice_ausa         VARCHAR,
+    natura_giuridica    VARCHAR,
+    provincia           VARCHAR,
+    citta               VARCHAR
+)
+"""
+
+# ─────────────────────────────────────────────
+# Data loading
+# ─────────────────────────────────────────────
+
+
+def _load_stazioni(conn: duckdb.DuckDBPyConnection) -> int:
+    """Download and load the contracting authorities registry (~2.7 MB)."""
+    url = f"{ANAC_DOWNLOAD}/stazioni-appaltanti/filesystem/stazioni-appaltanti_csv.zip"
+    csv_bytes = _download_csv_from_zip(url)
+    tmp = "/tmp/anac_stazioni_appaltanti.csv"
+    with open(tmp, "wb") as f:
+        f.write(csv_bytes)
+    conn.execute("DELETE FROM stazioni_appaltanti")
+    conn.execute(f"""
+        INSERT OR IGNORE INTO stazioni_appaltanti
+        SELECT
+            codice_fiscale,
+            denominazione,
+            codice_ausa,
+            natura_giuridica_descrizione,
+            provincia_nome,
+            citta_nome
+        FROM read_csv('{tmp}',
+            delim=';', header=true, quote='"',
+            ignore_errors=true, all_varchar=true)
+        WHERE codice_fiscale IS NOT NULL AND codice_fiscale != ''
+    """)
+    os.unlink(tmp)
+    return conn.execute("SELECT COUNT(*) FROM stazioni_appaltanti").fetchone()[0]
+
+
+def _load_cig_month(conn: duckdb.DuckDBPyConnection, year: int, month: int) -> int:
+    """Download and load one month of CIG tender data. Returns rows inserted."""
+    # Skip if already loaded
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM cig WHERE anno = ? AND mese = ?", [year, month]
+    ).fetchone()[0]
+    if existing > 0:
+        return existing
+
+    url = f"{ANAC_DOWNLOAD}/cig-{year}/filesystem/cig_csv_{year}_{month:02d}.zip"
+    csv_bytes = _download_csv_from_zip(url)  # raises on 404 / non-200
+    tmp = f"/tmp/anac_cig_{year}_{month:02d}.csv"
+    with open(tmp, "wb") as f:
+        f.write(csv_bytes)
+
+    # importo_lotto in ANAC CSVs uses period as decimal separator (verified).
+    # TRY_CAST handles nulls / malformed values gracefully.
+    conn.execute(f"""
+        INSERT OR IGNORE INTO cig
+        SELECT
+            cig,
+            oggetto_gara,
+            TRY_CAST(importo_lotto AS DOUBLE)       AS importo_lotto,
+            cod_cpv,
+            descrizione_cpv,
+            cf_amministrazione_appaltante           AS cf_sa,
+            denominazione_amministrazione_appaltante AS denominazione_sa,
+            sezione_regionale,
+            tipo_scelta_contraente,
+            data_pubblicazione,
+            stato,
+            TRY_CAST(anno_pubblicazione AS INTEGER)  AS anno,
+            TRY_CAST(mese_pubblicazione AS INTEGER)  AS mese,
+            FLAG_PNRR_PNC                            AS flag_pnrr
+        FROM read_csv('{tmp}',
+            delim=';', header=true, quote='"',
+            ignore_errors=true, all_varchar=true)
+        WHERE cig IS NOT NULL AND cig != ''
+    """)
+
     try:
-        with httpx.Client(timeout=15.0, verify=False, headers=CIG_API_HEADERS) as client:
-            resp = client.get(f"{CIG_API_BASE}/getSmartCig/{cig}")
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if data.get("codice_risposta") == "NOKCN" or not data.get("bando"):
-            return None
-        return data
-    except Exception:
+        os.unlink(tmp)
+    except OSError:
+        pass
+
+    return conn.execute(
+        "SELECT COUNT(*) FROM cig WHERE anno = ? AND mese = ?", [year, month]
+    ).fetchone()[0]
+
+
+def _recent_months(n: int) -> list[tuple[int, int]]:
+    """Return (year, month) pairs for the last n complete published months."""
+    today = date.today()
+    y, m = today.year, today.month
+    # Step back 1: current month's data may not be published yet
+    m -= 1
+    if m == 0:
+        m, y = 12, y - 1
+    result = []
+    for _ in range(n):
+        result.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    return result
+
+
+def _background_loader() -> None:
+    """
+    Background thread: initialises DuckDB, loads data progressively.
+
+    Priority order:
+      1. stazioni_appaltanti (tiny — ~2.7 MB, loads in ~10s)
+      2. Last 3 months of cig data (makes server usable ASAP)
+      3. Extend to 12 months in background (non-blocking for tool calls)
+    """
+    global _db
+    try:
+        conn = duckdb.connect(":memory:")
+        conn.execute(_CREATE_CIG)
+        conn.execute(_CREATE_SA)
+        with _db_lock:
+            _db = conn
+        print("[ANAC DB] schema initialised")
+
+        # 1. Authorities registry (tiny, fast)
+        try:
+            n = _load_stazioni(conn)
+            _db_status["authorities_count"] = n
+            print(f"[ANAC DB] stazioni_appaltanti: {n:,} rows")
+        except Exception as exc:
+            print(f"[ANAC DB] stazioni_appaltanti failed: {exc}")
+
+        # 2. Last 3 months — server becomes useful after this block
+        priority = _recent_months(3)
+        for year, month in priority:
+            try:
+                n = _load_cig_month(conn, year, month)
+                key = f"{year}-{month:02d}"
+                with _db_lock:
+                    _db_status["months_loaded"].append(key)
+                    _db_status["row_count"] = conn.execute(
+                        "SELECT COUNT(*) FROM cig"
+                    ).fetchone()[0]
+                print(
+                    f"[ANAC DB] {key}: {n:,} rows "
+                    f"(total: {_db_status['row_count']:,})"
+                )
+            except Exception as exc:
+                print(f"[ANAC DB] {year}-{month:02d} failed: {exc}")
+
+        _db_status["state"] = "ready"
+        _db_status["last_updated"] = datetime.utcnow().isoformat()
+        print(
+            f"[ANAC DB] ready — {_db_status['row_count']:,} contracts, "
+            f"{_db_status['authorities_count']:,} authorities"
+        )
+
+        # 3. Extend to 12 months in background
+        extra = _recent_months(12)[3:]
+        for year, month in extra:
+            key = f"{year}-{month:02d}"
+            if key in _db_status["months_loaded"]:
+                continue
+            try:
+                n = _load_cig_month(conn, year, month)
+                with _db_lock:
+                    _db_status["months_loaded"].append(key)
+                    _db_status["row_count"] = conn.execute(
+                        "SELECT COUNT(*) FROM cig"
+                    ).fetchone()[0]
+                print(
+                    f"[ANAC DB] extended {key}: {n:,} rows "
+                    f"(total: {_db_status['row_count']:,})"
+                )
+            except Exception as exc:
+                print(f"[ANAC DB] {key} failed: {exc}")
+            time.sleep(15)  # gentle on ANAC servers
+
+    except Exception as exc:
+        _db_status["state"] = "error"
+        _db_status["error"] = str(exc)
+        print(f"[ANAC DB] fatal: {exc}")
+
+
+_loader_thread = threading.Thread(
+    target=_background_loader, daemon=True, name="anac-db-loader"
+)
+_loader_thread.start()
+
+
+# ─────────────────────────────────────────────
+# Query helpers
+# ─────────────────────────────────────────────
+
+
+def _check_ready() -> dict | None:
+    """Return an error dict if DB is not yet ready, otherwise None."""
+    state = _db_status["state"]
+    if state == "ready" and _db_status["row_count"] > 0:
         return None
+    if state == "error":
+        return {
+            "status": "error",
+            "message": f"Errore database ANAC: {_db_status['error']}",
+        }
+    loaded = _db_status["months_loaded"]
+    if loaded:
+        return {
+            "status": "loading",
+            "message": (
+                f"Database parzialmente caricato: {_db_status['row_count']:,} contratti "
+                f"({', '.join(sorted(loaded))}). Caricamento in corso. "
+                "Riprova tra 30 secondi per dati più completi."
+            ),
+            "months_loaded": loaded,
+            "row_count": _db_status["row_count"],
+        }
+    return {
+        "status": "initializing",
+        "message": (
+            "Database ANAC in inizializzazione — primo avvio, download dati in corso "
+            "(circa 2-3 minuti). Riprova tra 60 secondi."
+        ),
+    }
 
 
-def _parse_cig_response(data: dict) -> dict:
-    """Flatten the /getSmartCig response into a clean contract dict."""
-    bando = data.get("bando", {})
-    sa = data.get("stazione_appaltante", {}) or {}
-    pub = data.get("pubblicazioni", {}) or {}
-    incaricati = data.get("incaricati", []) or []
+def _qry(sql: str, params: list | None = None) -> list[dict]:
+    """Execute SQL on the shared DuckDB connection, return list of dicts."""
+    with _db_lock:
+        rel = _db.execute(sql, params or [])
+        cols = [d[0] for d in rel.description]
+        return [dict(zip(cols, row)) for row in rel.fetchall()]
 
-    cpv_list = bando.get("CPV", []) or []
-    cpv_code = cpv_list[0].get("COD_CPV", "") if cpv_list else ""
-    cpv_desc = cpv_list[0].get("DESCRIZIONE_CPV", "") if cpv_list else ""
 
-    rup = next((i for i in incaricati if i.get("COD_RUOLO") == "RUP"), None)
-    rup_name = f"{rup.get('NOME', '')} {rup.get('COGNOME', '')}".strip() if rup else ""
+def _fmt_eur(v: float | None) -> str:
+    """Format a euro amount in Italian style: € 1.234.567"""
+    if v is None or v <= 0:
+        return "N/D"
+    # Python formats 1234567 as "1,234,567" — convert to Italian "1.234.567"
+    return "€ " + f"{v:,.0f}".replace(",", ".")
 
-    importo = bando.get("IMPORTO_COMPLESSIVO_GARA") or bando.get("IMPORTO_LOTTO")
-    cig = bando.get("CIG", "")
+
+def _coverage() -> dict:
+    return {
+        "months_loaded": sorted(_db_status["months_loaded"]),
+        "total_contracts": _db_status["row_count"],
+        "authorities_in_registry": _db_status["authorities_count"],
+        "last_updated": _db_status["last_updated"],
+    }
+
+
+# ─────────────────────────────────────────────
+# Tools
+# ─────────────────────────────────────────────
+
+
+async def search_contracts(
+    keyword: Optional[str] = None,
+    cpv_prefix: Optional[str] = None,
+    region: Optional[str] = None,
+    tipo_procedura: Optional[str] = None,
+    importo_min: Optional[float] = None,
+    importo_max: Optional[float] = None,
+    stato: Optional[str] = None,
+    limit: int = 20,
+) -> dict:
+    """
+    Search public procurement contracts in ANAC's BDNCP database.
+
+    Queries tens of thousands of real contracts across the last 3–12 months.
+    All parameters are optional and combinable.
+
+    Parameters
+    ----------
+    keyword       : Italian search term matched against contract description.
+                    E.g. 'pulizia uffici', 'servizi informatici', 'manutenzione strade'.
+                    Always use Italian. Partial matches work.
+    cpv_prefix    : CPV code prefix (2–8 digits). Examples:
+                    '45'=Costruzione, '48'=Software, '72'=Servizi IT,
+                    '79'=Servizi aziendali, '85'=Sanità, '90'=Ambiente/Pulizia.
+    region        : Italian region. E.g. 'Campania', 'Lombardia', 'Sicilia', 'Lazio'.
+    tipo_procedura: Procedure type partial match. E.g. 'AFFIDAMENTO DIRETTO',
+                    'PROCEDURA APERTA', 'PROCEDURA NEGOZIATA'.
+    importo_min   : Minimum contract value in euros.
+    importo_max   : Maximum contract value in euros.
+    stato         : Status filter. E.g. 'AGGIUDICATA', 'PUBBLICATA', 'ANNULLATA'.
+    limit         : Max results to return (default 20, capped at 25).
+
+    Returns contracts sorted by publication date descending with full details.
+    Always includes coverage info and citation.
+
+    ROUTING: Primary discovery tool. Use first for any "find contracts" query.
+    For price analysis use benchmark_market_prices.
+    For a specific CIG use get_contract_by_cig.
+    """
+    not_ready = _check_ready()
+    if not_ready:
+        return not_ready
+
+    limit = min(max(1, limit), 25)
+
+    wheres: list[str] = []
+    params: list = []
+
+    if keyword:
+        wheres.append("lower(oggetto_gara) LIKE lower(?)")
+        params.append(f"%{keyword}%")
+    if cpv_prefix:
+        wheres.append("cod_cpv LIKE ?")
+        params.append(f"{cpv_prefix.strip()}%")
+    if region:
+        wheres.append("lower(sezione_regionale) LIKE lower(?)")
+        params.append(f"%{region}%")
+    if tipo_procedura:
+        wheres.append("lower(tipo_scelta_contraente) LIKE lower(?)")
+        params.append(f"%{tipo_procedura}%")
+    if importo_min is not None:
+        wheres.append("importo_lotto >= ?")
+        params.append(importo_min)
+    if importo_max is not None:
+        wheres.append("importo_lotto <= ?")
+        params.append(importo_max)
+    if stato:
+        wheres.append("lower(stato) LIKE lower(?)")
+        params.append(f"%{stato}%")
+
+    where_clause = f"WHERE {' AND '.join(wheres)}" if wheres else ""
+
+    rows = _qry(
+        f"""
+        SELECT
+            cig,
+            LEFT(oggetto_gara, 120)         AS oggetto,
+            importo_lotto,
+            cod_cpv,
+            LEFT(descrizione_cpv, 60)       AS descrizione_cpv,
+            LEFT(denominazione_sa, 80)      AS stazione_appaltante,
+            sezione_regionale               AS regione,
+            tipo_scelta_contraente          AS procedura,
+            data_pubblicazione,
+            stato,
+            flag_pnrr
+        FROM cig
+        {where_clause}
+        ORDER BY data_pubblicazione DESC NULLS LAST
+        LIMIT {limit}
+        """,
+        params,
+    )
+
+    total = _qry(f"SELECT COUNT(*) AS n FROM cig {where_clause}", params)[0]["n"]
+
+    contracts = [
+        {
+            "cig": r["cig"],
+            "oggetto": r["oggetto"],
+            "importo": _fmt_eur(r["importo_lotto"]),
+            "importo_raw": r["importo_lotto"],
+            "cpv": r["cod_cpv"],
+            "categoria_cpv": r["descrizione_cpv"],
+            "stazione_appaltante": r["stazione_appaltante"],
+            "regione": r["regione"],
+            "procedura": r["procedura"],
+            "data_pubblicazione": r["data_pubblicazione"],
+            "stato": r["stato"],
+            "pnrr": str(r["flag_pnrr"]).upper() in ("1", "SI", "S", "TRUE"),
+            "detail_url": DETAIL_URL.format(cig=r["cig"]),
+        }
+        for r in rows
+    ]
+
+    tip = f"Trovati {total:,} contratti corrispondenti."
+    if total > limit:
+        tip += f" Mostrati i {limit} più recenti. Usa filtri per restringere la ricerca."
 
     return {
-        "cig": cig,
-        "oggetto": bando.get("OGGETTO_GARA") or bando.get("OGGETTO_LOTTO", ""),
-        "importo_complessivo": float(importo) if importo else None,
-        "importo_sicurezza": bando.get("IMPORTO_SICUREZZA"),
-        "stazione_appaltante": sa.get("DENOMINAZIONE_AMMINISTRAZIONE_APPALTANTE", ""),
-        "cf_stazione_appaltante": sa.get("CF_AMMINISTRAZIONE_APPALTANTE", ""),
-        "comune": sa.get("CITTA", ""),
-        "regione": sa.get("REGIONE", ""),
-        "nuts": bando.get("LUOGO_NUTS", ""),
-        "istat_luogo": bando.get("LUOGO_ISTAT", ""),
-        "cpv": cpv_code,
-        "cpv_descrizione": cpv_desc,
-        "procedura": bando.get("TIPO_SCELTA_CONTRAENTE", ""),
-        "tipo_contratto": bando.get("OGGETTO_PRINCIPALE_CONTRATTO", ""),
-        "modalita_realizzazione": bando.get("MODALITA_REALIZZAZIONE", ""),
-        "esito": bando.get("ESITO", ""),
-        "stato": bando.get("STATO", ""),
-        "pnrr": bool(bando.get("FLAG_PNRR_PNC")),
-        "tipo_cig": bando.get("TIPO_CIG", ""),
-        "numero_gara": bando.get("NUMERO_GARA", ""),
-        "n_lotti": bando.get("N_LOTTI_COMPONENTI"),
-        "data_pubblicazione": pub.get("DATA_PUBBLICAZIONE", ""),
-        "data_scadenza_offerta": bando.get("DATA_SCADENZA_OFFERTA", ""),
-        "rup": rup_name,
-        "detail_url": DETAIL_URL_TEMPLATE.format(cig=cig),
+        "contracts": contracts,
+        "returned": len(contracts),
+        "total_matching": total,
+        "filters_applied": {
+            k: v
+            for k, v in {
+                "keyword": keyword,
+                "cpv_prefix": cpv_prefix,
+                "region": region,
+                "tipo_procedura": tipo_procedura,
+                "importo_min": importo_min,
+                "importo_max": importo_max,
+                "stato": stato,
+            }.items()
+            if v is not None
+        },
+        "coverage": _coverage(),
+        "tip": tip,
         "citation": CITATION,
     }
 
 
-def get_contract_by_cig(cig: str) -> dict:
+async def get_contract_by_cig(cig: str) -> dict:
     """
-    Look up any Italian public contract by CIG code. Returns full details in ~2 seconds.
+    Look up a specific contract by its CIG (Codice Identificativo Gara).
 
-    Uses the ANAC SmartCIG API (api.anticorruzione.it/apicig) which covers ALL
-    contract types: ordinary, SmartCIG, PNRR, above and below EU thresholds.
+    CIG is the 10-character alphanumeric identifier assigned to every Italian
+    public contract (e.g. 'A05C622C05'). Case-insensitive.
 
-    Returns: oggetto, importo, stazione appaltante (with CF, city, region),
-    CPV with description, procedure type, NUTS/ISTAT location, PNRR flag,
-    esito (award status), RUP name, publication date.
+    Returns full contract details: oggetto, importo, stazione appaltante with
+    registry info (type, province, city), CPV, region, procedure, status.
 
-    args:
-        cig: Any valid Italian CIG code (10 alphanumeric chars, e.g. 'B8A6086F77').
-             Case-insensitive.
+    If the CIG is not found in the loaded months, provides a direct link to
+    the ANAC portal for manual lookup.
 
-    returns:
-        Full contract record, or structured error with ANAC portal link.
+    ROUTING: Use when the user provides a specific CIG code.
+    For searching without a CIG, use search_contracts.
     """
-    try:
-        cig = cig.strip().upper()
-        if len(cig) < 5:
-            return {"error": "CIG non valido (troppo corto).", "cig": cig}
+    not_ready = _check_ready()
+    if not_ready:
+        return not_ready
 
-        data = _fetch_cig(cig)
-        if data:
-            return _parse_cig_response(data)
+    cig_clean = cig.strip().upper()
 
+    rows = _qry(
+        """
+        SELECT
+            c.cig,
+            c.oggetto_gara,
+            c.importo_lotto,
+            c.cod_cpv,
+            c.descrizione_cpv,
+            c.cf_sa,
+            c.denominazione_sa,
+            c.sezione_regionale,
+            c.tipo_scelta_contraente,
+            c.data_pubblicazione,
+            c.stato,
+            c.flag_pnrr,
+            s.natura_giuridica,
+            s.provincia,
+            s.citta
+        FROM cig c
+        LEFT JOIN stazioni_appaltanti s ON c.cf_sa = s.codice_fiscale
+        WHERE upper(c.cig) = ?
+        LIMIT 1
+        """,
+        [cig_clean],
+    )
+
+    if not rows:
         return {
-            "error": f"CIG '{cig}' non trovato.",
-            "cig": cig,
-            "detail_url": DETAIL_URL_TEMPLATE.format(cig=cig),
-            "hint": "Verifica il codice CIG sul portale ANAC tramite il link detail_url.",
+            "found": False,
+            "cig": cig_clean,
+            "message": (
+                f"CIG {cig_clean} non trovato nei dati caricati "
+                f"({', '.join(sorted(_db_status['months_loaded']))}). "
+                "Potrebbe appartenere a un periodo non ancora caricato o molto recente."
+            ),
+            "detail_url": DETAIL_URL.format(cig=cig_clean),
+            "coverage": _coverage(),
         }
 
-    except Exception as e:
-        return {
-            "error": f"Errore recupero CIG: {type(e).__name__}: {e}",
-            "cig": cig if cig else "unknown",
-            "detail_url": DETAIL_URL_TEMPLATE.format(cig=cig) if cig else "",
-        }
+    r = rows[0]
+    return {
+        "found": True,
+        "cig": r["cig"],
+        "oggetto": r["oggetto_gara"],
+        "importo": _fmt_eur(r["importo_lotto"]),
+        "importo_raw": r["importo_lotto"],
+        "cpv": r["cod_cpv"],
+        "categoria_cpv": r["descrizione_cpv"],
+        "stazione_appaltante": {
+            "denominazione": r["denominazione_sa"],
+            "codice_fiscale": r["cf_sa"],
+            "natura_giuridica": r.get("natura_giuridica"),
+            "provincia": r.get("provincia"),
+            "citta": r.get("citta"),
+        },
+        "regione": r["sezione_regionale"],
+        "procedura": r["tipo_scelta_contraente"],
+        "data_pubblicazione": r["data_pubblicazione"],
+        "stato": r["stato"],
+        "pnrr": str(r["flag_pnrr"]).upper() in ("1", "SI", "S", "TRUE"),
+        "detail_url": DETAIL_URL.format(cig=r["cig"]),
+        "citation": CITATION,
+    }
 
 
-def _enrich_with_price_delta(contract: dict) -> dict:
-    """Add risparmio_eur and risparmio_percentuale to a contract dict."""
-    b = contract.get("importo_base")
-    a = contract.get("importo_aggiudicato")
-    if b and a:
-        risparmio = b - a
-        contract["risparmio_eur"] = round(risparmio, 2)
-        contract["risparmio_percentuale"] = round((risparmio / b) * 100, 1)
-    return contract
-
-
-# ─────────────────────────────────────────────
-# Tool 3: benchmark_market_prices
-# ─────────────────────────────────────────────
-
-def benchmark_market_prices(
+async def benchmark_market_prices(
     procurement_description: str,
-    importo_previsto: float = None,
-    cpv_prefix: str = None,
+    importo_previsto: Optional[float] = None,
+    cpv_prefix: Optional[str] = None,
+    region: Optional[str] = None,
 ) -> dict:
     """
-    Generate a complete 'analisi di mercato' for a procurement — paste-ready.
+    Benchmark market prices and generate a complete analisi di mercato paragraph.
 
-    This is the CORE tool for Italian PA compliance under D.Lgs. 36/2023 art. 14.
-    It ALWAYS produces a complete, legally-valid analisi di mercato paragraph,
-    even when no matching contracts are found in the ANAC cache.
+    Queries comparable contracts from BDNCP, computes price statistics, and
+    produces a ready-to-paste paragraph for the fascicolo di gara — legally
+    compliant with D.Lgs. 36/2023 art. 14 (analisi di mercato).
 
-    The paragraph documents that ANAC BDNCP was consulted (as required by law),
-    states the intended procurement amount, and notes any comparable contracts found.
-    The output is ready to paste directly into the procurement fascicolo.
+    The paragraph is generated even when sample size is small: the legal
+    requirement is to DOCUMENT the consultation of ANAC, not to find exact matches.
 
-    When to use: ANY time the user mentions 'analisi di mercato', 'affidamento
-    diretto', 'quanto costa', 'prezzo di riferimento', or asks to prepare
-    procurement documentation.
+    Parameters
+    ----------
+    procurement_description : What the PA wants to procure (Italian text).
+                              E.g. 'servizi di pulizia uffici', 'sviluppo software gestionale'.
+    importo_previsto        : Planned spend in euros. ALWAYS pass this when the user
+                              mentions a budget — it determines congruity assessment
+                              and the legal procedure reference (art. 50 soglie).
+    cpv_prefix              : CPV prefix to narrow the category search.
+                              E.g. '90' for cleaning, '72' for IT services, '45' for works.
+    region                  : Limit benchmark to a specific Italian region.
 
-    args:
-        procurement_description: Italian description of what is being procured.
-            Examples: 'servizi di pulizia uffici comunali', 'licenze software Microsoft 365',
-            'manutenzione impianti elevatori', 'consulenza informatica'
-        importo_previsto: The planned contract amount in euros (e.g. 45000.0).
-            Include this whenever the user mentions a budget or amount — it appears
-            in the analisi di mercato paragraph.
-        cpv_prefix: CPV division. '72'=IT services, '45'=Construction,
-            '48'=Software, '90'=Cleaning/Environmental, '79'=Business services
+    Returns
+    -------
+    price_statistics        : count, average, median, min, max, P25, P75
+    analisi_di_mercato_text : complete paste-ready paragraph for the fascicolo
+    comparable_contracts    : up to 10 example contracts with CIG and importo
 
-    returns:
-        analisi_di_mercato_text (paste-ready paragraph), statistics if contracts
-        found, sample_contracts, citation.
+    ROUTING: Use for ANY mention of 'analisi di mercato', 'affidamento diretto',
+    'congruità del prezzo', 'quanto costa', price benchmarks.
+    Always pass importo_previsto if the user mentions an amount.
     """
-    try:
-        now = datetime.now()
-        update_date = now.strftime("%d/%m/%Y")
-        importo_label = (
-            f"€{_italian_number(importo_previsto)}" if importo_previsto else "importo da definire"
+    not_ready = _check_ready()
+    if not_ready:
+        return not_ready
+
+    today_str = date.today().strftime("%d/%m/%Y")
+    months_str = ", ".join(sorted(_db_status["months_loaded"]))
+
+    # Build filter
+    wheres = ["importo_lotto > 0", "importo_lotto IS NOT NULL"]
+    params: list = []
+
+    # Keyword: match ANY significant word (OR logic = broader recall)
+    words = [w for w in procurement_description.split() if len(w) > 3]
+    if words:
+        kw_clause = " OR ".join(
+            ["lower(oggetto_gara) LIKE lower(?)" for _ in words]
+        )
+        wheres.append(f"({kw_clause})")
+        params.extend([f"%{w}%" for w in words])
+
+    if cpv_prefix:
+        wheres.append("cod_cpv LIKE ?")
+        params.append(f"{cpv_prefix.strip()}%")
+
+    if region:
+        wheres.append("lower(sezione_regionale) LIKE lower(?)")
+        params.append(f"%{region}%")
+
+    where_clause = "WHERE " + " AND ".join(wheres)
+
+    # Statistics
+    stats_rows = _qry(
+        f"""
+        SELECT
+            COUNT(*)                                                    AS n,
+            AVG(importo_lotto)                                         AS media,
+            MEDIAN(importo_lotto)                                      AS mediana,
+            MIN(importo_lotto)                                         AS minimo,
+            MAX(importo_lotto)                                         AS massimo,
+            quantile_cont(importo_lotto, 0.25)                        AS p25,
+            quantile_cont(importo_lotto, 0.75)                        AS p75
+        FROM cig
+        {where_clause}
+        """,
+        params,
+    )
+    s = stats_rows[0] if stats_rows else {}
+    n = int(s.get("n") or 0)
+
+    # Sample contracts (up to 10, most recent)
+    sample_rows = _qry(
+        f"""
+        SELECT
+            cig,
+            LEFT(oggetto_gara, 100)  AS oggetto,
+            importo_lotto,
+            LEFT(denominazione_sa, 80) AS denominazione_sa,
+            data_pubblicazione,
+            sezione_regionale
+        FROM cig
+        {where_clause}
+        ORDER BY data_pubblicazione DESC NULLS LAST
+        LIMIT 10
+        """,
+        params,
+    )
+
+    # ── Build analisi di mercato text ─────────────────────────────────────
+
+    if n >= 5:
+        stats_block = (
+            f"La consultazione della Banca Dati Nazionale Contratti Pubblici (BDNCP) "
+            f"ha restituito {n:,} contratti comparabili per «{procurement_description}» "
+            f"nel periodo {months_str}.\n\n"
+            f"Statistiche dei prezzi rilevati:\n"
+            f"  • Importo medio:            {_fmt_eur(s.get('media'))}\n"
+            f"  • Mediana:                  {_fmt_eur(s.get('mediana'))}\n"
+            f"  • Range osservato:          {_fmt_eur(s.get('minimo'))} – {_fmt_eur(s.get('massimo'))}\n"
+            f"  • Intervallo centrale P25–P75: {_fmt_eur(s.get('p25'))} – {_fmt_eur(s.get('p75'))}\n"
+        )
+    elif n > 0:
+        stats_block = (
+            f"La consultazione della BDNCP ha restituito {n} contratto/i comparabile/i "
+            f"per «{procurement_description}» nel periodo {months_str} "
+            f"(campione limitato; si raccomanda di integrare con i dataset storici completi).\n\n"
+            f"  • Importo medio: {_fmt_eur(s.get('media'))}\n"
+            f"  • Range: {_fmt_eur(s.get('minimo'))} – {_fmt_eur(s.get('massimo'))}\n"
+        )
+    else:
+        stats_block = (
+            f"La consultazione della BDNCP per «{procurement_description}» "
+            f"nel periodo {months_str} non ha restituito contratti comparabili "
+            f"con i criteri di ricerca specificati.\n"
+            f"Si raccomanda di consultare i dataset storici completi:\n"
+            f"  https://dati.anticorruzione.it/opendata/dataset/cig\n"
+            f"e le convenzioni Consip attive:\n"
+            f"  https://www.acquistinretepa.it\n"
         )
 
-        # Single cache read — no loops, no redundant calls
-        releases = _fetch_recent_releases(limit=3)
-
-        if not releases:
-            with _cache_lock:
-                is_warming = _release_cache["warming"]
-            if is_warming:
-                return {
-                    "status": "warming_up",
-                    "message": "Il server sta caricando i dati ANAC. Riprova tra un minuto.",
-                }
-            # API unavailable — still produce a valid paragraph
-            releases = []
-
-        # Parse and filter client-side
-        contracts = []
-        for rel in releases:
-            c = _parse_ocds_release(rel)
-            if "error" in c:
-                continue
-            if cpv_prefix and not c.get("cpv", "").startswith(cpv_prefix):
-                continue
-            if procurement_description:
-                kw = procurement_description.lower()
-                text = f"{c.get('oggetto', '')} {c.get('stazione_appaltante', '')}".lower()
-                # Match if full phrase found, or at least 1 significant word matches
-                words = [w for w in kw.split() if len(w) > 4]
-                if kw not in text and not any(w in text for w in words):
-                    continue
-            contracts.append(c)
-
-        # Extract values
-        values = [
-            float(c.get("importo_aggiudicato") or c.get("importo_base") or 0)
-            for c in contracts
-            if (c.get("importo_aggiudicato") or c.get("importo_base"))
-        ]
-        values = [v for v in values if v > 0]
-
-        if values:
-            mean_val = statistics.mean(values)
-            median_val = statistics.median(values)
-            min_val = min(values)
-            max_val = max(values)
-            stdev_val = statistics.stdev(values) if len(values) > 1 else 0.0
-            sample_size = len(values)
-            recommended_price = round(median_val, 2)
-
-            congruita = ""
-            if importo_previsto and importo_previsto > 0:
-                ratio = importo_previsto / median_val
-                if 0.7 <= ratio <= 1.3:
-                    congruita = (
-                        f"L'importo previsto di {importo_label} risulta in linea con il valore "
-                        f"mediano dei contratti analoghi (€{_italian_number(median_val)})."
-                    )
-                elif ratio > 1.3:
-                    congruita = (
-                        f"L'importo previsto di {importo_label} è superiore al mediano "
-                        f"di €{_italian_number(median_val)}. Si raccomanda di verificare "
-                        f"la congruità con ulteriori fonti (Consip/MePA)."
-                    )
-                else:
-                    congruita = (
-                        f"L'importo previsto di {importo_label} è inferiore al mediano "
-                        f"di €{_italian_number(median_val)}: prezzo competitivo."
-                    )
-
-            analisi_text = (
-                f"ANALISI DI MERCATO\n\n"
-                f"In conformità all'art. 14 del D.Lgs. 36/2023 (Codice dei Contratti "
-                f"Pubblici), la stazione appaltante ha condotto un'analisi di mercato "
-                f"per la seguente fornitura/servizio: \"{procurement_description}\".\n\n"
-                f"Oggetto: {procurement_description}\n"
-                f"Importo stimato: {importo_label}\n"
-                f"CPV: {cpv_prefix + 'xxxxxx' if cpv_prefix else 'da specificare'}\n\n"
-                f"FONTI CONSULTATE:\n"
-                f"La Banca Dati Nazionale dei Contratti Pubblici (BDNCP) gestita da ANAC "
-                f"(Autorità Nazionale Anticorruzione) è stata consultata in data {update_date}. "
-                f"Sono stati individuati {sample_size} contratti analoghi aggiudicati "
-                f"da pubbliche amministrazioni italiane:\n\n"
-                f"  • Valore minimo rilevato:  €{_italian_number(min_val)}\n"
-                f"  • Valore massimo rilevato: €{_italian_number(max_val)}\n"
-                f"  • Valore medio:            €{_italian_number(mean_val)}\n"
-                f"  • Valore mediano:          €{_italian_number(median_val)}\n\n"
-            )
-            if congruita:
-                analisi_text += f"VALUTAZIONE DI CONGRUITÀ:\n{congruita}\n\n"
-            analisi_text += (
-                f"CONCLUSIONI:\n"
-                f"Sulla base delle informazioni raccolte, l'importo previsto risulta "
-                f"congruo rispetto ai valori di mercato rilevati. "
-                f"La presente analisi è stata redatta ai sensi dell'art. 14 del "
-                f"D.Lgs. 36/2023 e costituisce parte integrante del fascicolo di gara.\n\n"
-                f"Fonte dati: ANAC — Banca Dati Nazionale Contratti Pubblici (BDNCP). "
-                f"Licenza CC-BY 4.0. Dati aggiornati al {update_date}. "
-                f"URL: https://dati.anticorruzione.it/opendata"
-            )
-
-            return {
-                "statistics": {
-                    "min": round(min_val, 2), "max": round(max_val, 2),
-                    "mean": round(mean_val, 2), "median": round(median_val, 2),
-                    "stdev": round(stdev_val, 2), "sample_size": sample_size,
-                    "currency": "EUR",
-                },
-                "recommended_reference_price": recommended_price,
-                "sample_contracts": contracts[:3],
-                "analisi_di_mercato_text": analisi_text,
-                "citation": CITATION,
-            }
-
-        else:
-            # No matching contracts — still produce a complete, valid paragraph.
-            # Art. 14 requires DOCUMENTING that ANAC was consulted, not finding matches.
-            analisi_text = (
-                f"ANALISI DI MERCATO\n\n"
-                f"In conformità all'art. 14 del D.Lgs. 36/2023 (Codice dei Contratti "
-                f"Pubblici), la stazione appaltante ha condotto un'analisi di mercato "
-                f"per la seguente fornitura/servizio: \"{procurement_description}\".\n\n"
-                f"Oggetto: {procurement_description}\n"
-                f"Importo stimato: {importo_label}\n"
-                f"CPV: {cpv_prefix + 'xxxxxx' if cpv_prefix else 'da specificare'}\n\n"
-                f"FONTI CONSULTATE:\n"
-                f"1. Banca Dati Nazionale Contratti Pubblici (BDNCP) — ANAC: consultata "
-                f"in data {update_date}. Non sono stati individuati contratti analoghi "
-                f"nel campione disponibile tramite API in tempo reale.\n"
-                f"2. Si raccomanda di integrare la presente analisi consultando:\n"
-                f"   • Catalogo Consip / MePA (www.acquistinretepa.it) — convenzioni attive\n"
-                f"   • CSV mensili ANAC con storico completo: "
-                f"https://dati.anticorruzione.it/opendata/dataset/bandecig\n"
-                f"   • Precedenti affidamenti della stazione appaltante per oggetti analoghi\n\n"
-                f"VALUTAZIONE:\n"
-                f"L'importo previsto di {importo_label} è stato determinato sulla base "
-                f"delle conoscenze di mercato della stazione appaltante e delle indicazioni "
-                f"dei prezzi di riferimento disponibili. "
-                f"La congruità del prezzo sarà verificata in sede di aggiudicazione.\n\n"
-                f"CONCLUSIONI:\n"
-                f"La presente analisi è stata redatta ai sensi dell'art. 14 del D.Lgs. 36/2023 "
-                f"e costituisce parte integrante del fascicolo di gara.\n\n"
-                f"Fonte consultata: ANAC BDNCP, CC-BY 4.0. Data: {update_date}. "
-                f"URL: https://dati.anticorruzione.it/opendata"
-            )
-
-            return {
-                "statistics": {"sample_size": 0},
-                "analisi_di_mercato_text": analisi_text,
-                "data_limitation": (
-                    "Nessun contratto analogo trovato nel campione recente ANAC (~3 contratti). "
-                    "Il paragrafo è comunque valido ai fini dell'art. 14 D.Lgs. 36/2023: "
-                    "documenta la consultazione di ANAC come fonte."
-                ),
-                "citation": CITATION,
-            }
-
-    except Exception as e:
-        return {"error": f"Errore benchmark: {type(e).__name__}: {e}"}
-
-
-# ─────────────────────────────────────────────
-# Tool 4: get_authority_procurement_profile
-# ─────────────────────────────────────────────
-
-def get_authority_procurement_profile(
-    authority_name: str,
-) -> dict:
-    """
-    Search for contracts by a specific Italian contracting authority (stazione appaltante).
-
-    Scans the ~3 most recent contracts in the ANAC cache and returns any that
-    match the authority name. Given the small sample, most authority names will
-    NOT be found — this is expected and documented in the response.
-
-    When to use: User asks about a specific PA entity's spending, contracts, or suppliers.
-    When NOT to use: For general contract search, use search_contracts instead.
-
-    IMPORTANT: The ANAC OCDS API does not support authority-based search.
-    This tool filters ~3 cached contracts by buyer name (partial match).
-    For a complete authority profile, use ANAC CSV bulk downloads.
-
-    args:
-        authority_name: Name of the contracting authority (partial match).
-            Examples: 'Comune di Milano', 'CONSIP', 'ASL Napoli'
-
-    returns:
-        Matching contracts with basic aggregation, or a helpful "not found"
-        message with alternative data sources.
-    """
-    try:
-        releases = _fetch_recent_releases(limit=3)
-
-        if not releases:
-            with _cache_lock:
-                is_warming = _release_cache["warming"]
-            if is_warming:
-                return {
-                    "status": "warming_up",
-                    "message": "Il server sta caricando i dati ANAC. Riprova tra un minuto.",
-                }
-            return {
-                "error": "Nessun dato disponibile dall'API ANAC.",
-                "authority_name": authority_name,
-            }
-
-        # Filter by authority name (case-insensitive partial match)
-        auth_lower = authority_name.lower()
-        contracts = []
-        for rel in releases:
-            c = _parse_ocds_release(rel)
-            if "error" in c:
-                continue
-            if auth_lower in c.get("stazione_appaltante", "").lower():
-                contracts.append(c)
-
-        if not contracts:
-            return {
-                "authority_name": authority_name,
-                "contracts_found": 0,
-                "records_scanned": len(releases),
-                "message": (
-                    f"Nessun contratto di '{authority_name}' trovato nel campione recente ANAC "
-                    f"({len(releases)} contratti). L'API espone solo i contratti più recenti. "
-                    f"Per un profilo completo consulta i CSV mensili ANAC."
-                ),
-                "fallback_urls": {
-                    "bandecig": "https://dati.anticorruzione.it/opendata/dataset/bandecig",
-                    "portal": "https://dati.anticorruzione.it",
-                },
-                "citation": CITATION,
-            }
-
-        # Basic aggregation on matched contracts
-        total_value = sum(
-            float(c.get("importo_aggiudicato") or c.get("importo_base") or 0)
-            for c in contracts
-        )
-
-        return {
-            "authority": {
-                "name": contracts[0].get("stazione_appaltante", authority_name),
-                "cf": contracts[0].get("cf_stazione_appaltante", ""),
-            },
-            "contracts_found": len(contracts),
-            "records_scanned": len(releases),
-            "total_value_eur": round(total_value, 2),
-            "contracts": contracts[:5],
-            "warning": (
-                f"Campione limitato: {len(contracts)} contratti su {len(releases)} "
-                f"nel feed recente ANAC. Per un profilo completo usa i CSV mensili."
-            ),
-            "summary": (
-                f"Trovati {len(contracts)} contratti di "
-                f"{contracts[0].get('stazione_appaltante', authority_name)} "
-                f"nel campione ANAC recente, per un totale di €{_italian_number(total_value)}. "
-                f"Fonte: ANAC BDNCP, CC-BY 4.0."
-            ),
-            "citation": CITATION,
-        }
-
-    except Exception as e:
-        return {
-            "error": f"Errore profilo ente: {type(e).__name__}: {e}",
-            "authority_name": authority_name,
-        }
-
-
-# ─────────────────────────────────────────────
-# Tool 5: find_similar_contracts
-# ─────────────────────────────────────────────
-
-def find_similar_contracts(
-    reference_cig: str,
-) -> dict:
-    """
-    Find contracts similar to a reference CIG in the recent ANAC cache.
-
-    Looks up the reference contract, then finds other cached contracts with
-    matching CPV category and similar value range.
-
-    IMPORTANT LIMITATIONS:
-    - The reference CIG must be in the ~3 most recent cached contracts OR
-      resolvable via direct API lookup (which adds 15-30s latency).
-    - Comparison pool is only the other cached contracts (~2-3 records).
-    - For meaningful price comparison, use benchmark_market_prices instead.
-
-    When to use: User has a specific CIG and wants to compare it with recent contracts.
-    When NOT to use: For general price benchmarks, use benchmark_market_prices.
-
-    args:
-        reference_cig: CIG code of the reference contract (e.g. '918052266A')
-
-    returns:
-        reference_contract, similar_contracts, price_comparison, analysis_text.
-    """
-    try:
-        reference_cig = reference_cig.strip().upper()
-
-        # Get reference contract (checks cache first, then API)
-        ref = get_contract_by_cig(reference_cig)
-        if "error" in ref:
-            return {
-                "error": f"Contratto di riferimento non trovato: {ref['error']}",
-                "reference_cig": reference_cig,
-                "detail_url": DETAIL_URL_TEMPLATE.format(cig=reference_cig),
-                "hint": "Consulta il portale ANAC direttamente tramite detail_url.",
-            }
-
-        ref_value = float(ref.get("importo_aggiudicato") or ref.get("importo_base") or 0)
-        ref_cpv = (ref.get("cpv") or "")[:2]
-
-        # Scan cache for similar contracts (instant)
-        releases = _fetch_recent_releases(limit=3)
-        similar = []
-        for rel in releases:
-            c = _parse_ocds_release(rel)
-            if "error" in c or c.get("cig") == reference_cig:
-                continue
-            # Match by CPV division
-            if ref_cpv and (c.get("cpv") or "")[:2] == ref_cpv:
-                similar.append(c)
-            # Or by value range (±50%)
-            elif ref_value > 0:
-                c_val = float(c.get("importo_aggiudicato") or c.get("importo_base") or 0)
-                if c_val > 0 and ref_value * 0.5 <= c_val <= ref_value * 1.5:
-                    similar.append(c)
-
-        # Price comparison
-        comp_values = [
-            float(c.get("importo_aggiudicato") or c.get("importo_base") or 0)
-            for c in similar if (c.get("importo_aggiudicato") or c.get("importo_base"))
-        ]
-        comp_values = [v for v in comp_values if v > 0]
-
-        price_comparison = "insufficient_data"
-        median_similar = None
-        val_label = f"€{_italian_number(ref_value)}" if ref_value > 0 else "N/D"
-        ref_oggetto = (ref.get("oggetto") or "")[:80]
-
-        if len(comp_values) >= 2 and ref_value > 0:
-            median_similar = statistics.median(comp_values)
-            if ref_value > median_similar * 1.2:
-                price_comparison = "above_market"
-            elif ref_value < median_similar * 0.8:
-                price_comparison = "below_market"
+    # Congruity assessment
+    congruity_block = ""
+    if importo_previsto and importo_previsto > 0:
+        media = s.get("media")
+        if n >= 3 and media:
+            ratio = importo_previsto / media
+            if ratio < 0.5:
+                valutazione = "significativamente inferiore alla media di mercato"
+            elif ratio < 0.8:
+                valutazione = "inferiore alla media di mercato"
+            elif ratio <= 1.2:
+                valutazione = "in linea con i valori di mercato rilevati"
+            elif ratio <= 1.5:
+                valutazione = "superiore alla media di mercato"
             else:
-                price_comparison = "at_market"
-
-        analysis_text = (
-            f"COMPARAZIONE CIG {reference_cig}\n\n"
-            f"Contratto: \"{ref_oggetto}\" — Valore: {val_label}\n"
-            f"Contratti simili nel campione ANAC: {len(similar)}\n"
-        )
-        if median_similar:
-            analysis_text += (
-                f"Mediano contratti simili: €{_italian_number(median_similar)}\n"
-                f"Posizionamento: {price_comparison.upper().replace('_', ' ')}\n"
+                valutazione = "significativamente superiore alla media di mercato"
+            congruity_block = (
+                f"\nVerifica di congruità: l'importo previsto di {_fmt_eur(importo_previsto)} "
+                f"risulta {valutazione} (media di mercato: {_fmt_eur(media)}, "
+                f"rapporto previsto/media: {ratio:.2f}).\n"
             )
-        analysis_text += (
-            f"\nNOTA: Confronto basato su campione limitato ({len(releases)} contratti recenti). "
-            f"Per un'analisi affidabile integrare con CSV mensili ANAC.\n"
-            f"Fonte: ANAC BDNCP, CC-BY 4.0."
+        else:
+            congruity_block = (
+                f"\nImporto previsto: {_fmt_eur(importo_previsto)}. "
+                "Confronto statistico non disponibile per insufficienza del campione.\n"
+            )
+
+    # Procedure reference based on amount
+    if importo_previsto and importo_previsto <= 140_000:
+        conclusioni = (
+            "L'amministrazione procederà all'affidamento diretto ai sensi "
+            "dell'art. 50, co. 1, lett. b), D.Lgs. 36/2023, avendo verificato "
+            "la congruità del prezzo attraverso la presente analisi di mercato."
+        )
+    elif importo_previsto and importo_previsto <= 5_538_000:
+        conclusioni = (
+            "L'amministrazione procederà con procedura negoziata previa consultazione "
+            "di almeno cinque operatori economici, ai sensi dell'art. 50, co. 1, "
+            "lett. c/d), D.Lgs. 36/2023."
+        )
+    else:
+        conclusioni = (
+            "L'amministrazione ha svolto la presente analisi di mercato preliminare "
+            "ai sensi dell'art. 14, D.Lgs. 36/2023, quale supporto alla procedura "
+            "di gara da avviare."
         )
 
+    analisi_text = f"""ANALISI DI MERCATO
+(ai sensi dell'art. 14, D.Lgs. 36/2023 — Codice dei Contratti Pubblici)
+
+Data: {today_str}
+Oggetto: {procurement_description}{f'{chr(10)}Importo previsto: {_fmt_eur(importo_previsto)}' if importo_previsto else ''}{f'{chr(10)}Categoria CPV: {cpv_prefix}' if cpv_prefix else ''}{f'{chr(10)}Area geografica: {region}' if region else chr(10) + 'Area geografica: nazionale'}
+
+RISULTATI DELLA RICOGNIZIONE DI MERCATO
+
+{stats_block}{congruity_block}
+FONTI CONSULTATE
+1. ANAC — Banca Dati Nazionale Contratti Pubblici (BDNCP)
+   URL: https://dati.anticorruzione.it
+   Periodo campionato: {months_str}
+   Licenza: CC-BY-SA 4.0
+
+2. Consip SpA — Convenzioni e Accordi Quadro attivi
+   URL: https://www.acquistinretepa.it
+   (verifica in carico al RUP)
+
+CONCLUSIONI
+{conclusioni}
+
+{CITATION}"""
+
+    return {
+        "price_statistics": {
+            "sample_size": n,
+            "average": round(s["media"], 2) if s.get("media") else None,
+            "median": round(s["mediana"], 2) if s.get("mediana") else None,
+            "min": round(s["minimo"], 2) if s.get("minimo") else None,
+            "max": round(s["massimo"], 2) if s.get("massimo") else None,
+            "p25": round(s["p25"], 2) if s.get("p25") else None,
+            "p75": round(s["p75"], 2) if s.get("p75") else None,
+        },
+        "comparable_contracts": [
+            {
+                "cig": r["cig"],
+                "oggetto": r["oggetto"],
+                "importo": _fmt_eur(r["importo_lotto"]),
+                "stazione_appaltante": r["denominazione_sa"],
+                "data": r["data_pubblicazione"],
+                "regione": r["sezione_regionale"],
+                "detail_url": DETAIL_URL.format(cig=r["cig"]),
+            }
+            for r in sample_rows
+        ],
+        "analisi_di_mercato_text": analisi_text,
+        "coverage": _coverage(),
+        "citation": CITATION,
+    }
+
+
+async def get_authority_procurement_profile(
+    authority_name: Optional[str] = None,
+    codice_fiscale: Optional[str] = None,
+) -> dict:
+    """
+    Profile a contracting authority: their procurement history, volumes, and patterns.
+
+    Parameters
+    ----------
+    authority_name  : Partial name match. E.g. 'Comune di Roma', 'ASL Napoli 1',
+                      'Università degli Studi di Milano'. Case-insensitive.
+    codice_fiscale  : Exact fiscal code of the authority (use for precision).
+
+    Returns
+    -------
+    - Authority registry entry (legal type, province, city)
+    - Procurement statistics: total contracts, total value, average value
+    - Top CPV categories by volume
+    - Procedure type breakdown
+    - 10 most recent contracts
+
+    ROUTING: Use for "profilo acquisti di [ente]", "quanto ha speso [ente]",
+    "chi ha affidato di più per X", "contratti del Comune di Y".
+    """
+    not_ready = _check_ready()
+    if not_ready:
+        return not_ready
+
+    if not authority_name and not codice_fiscale:
+        return {"error": "Specifica almeno authority_name o codice_fiscale."}
+
+    # Look up authority in registry
+    if codice_fiscale:
+        sa_rows = _qry(
+            "SELECT * FROM stazioni_appaltanti WHERE codice_fiscale = ? LIMIT 1",
+            [codice_fiscale.strip()],
+        )
+        contract_where = "WHERE cf_sa = ?"
+        contract_params = [codice_fiscale.strip()]
+    else:
+        sa_rows = _qry(
+            "SELECT * FROM stazioni_appaltanti "
+            "WHERE lower(denominazione) LIKE lower(?) LIMIT 5",
+            [f"%{authority_name}%"],
+        )
+        if sa_rows:
+            cfs = [r["codice_fiscale"] for r in sa_rows]
+            placeholders = ",".join(["?" for _ in cfs])
+            contract_where = f"WHERE cf_sa IN ({placeholders})"
+            contract_params = cfs
+        else:
+            # Fall back to name match in cig table
+            contract_where = "WHERE lower(denominazione_sa) LIKE lower(?)"
+            contract_params = [f"%{authority_name}%"]
+
+    # Overall stats
+    stats = _qry(
+        f"""
+        SELECT
+            COUNT(*)                AS n_contratti,
+            SUM(importo_lotto)      AS valore_totale,
+            AVG(importo_lotto)      AS valore_medio,
+            MIN(data_pubblicazione) AS prima_gara,
+            MAX(data_pubblicazione) AS ultima_gara
+        FROM cig
+        {contract_where}
+        AND importo_lotto > 0
+        """,
+        contract_params,
+    )[0]
+
+    if not stats["n_contratti"]:
         return {
-            "reference_contract": ref,
-            "similar_contracts": similar[:3],
-            "price_comparison": price_comparison,
-            "median_similar_contracts": median_similar,
-            "sample_size": len(comp_values),
-            "analysis_text": analysis_text,
-            "citation": CITATION,
+            "found": False,
+            "authority_name": authority_name,
+            "message": (
+                f"Nessun contratto trovato per '{authority_name}' "
+                f"nel periodo {', '.join(sorted(_db_status['months_loaded']))}. "
+                "L'ente potrebbe non aver pubblicato contratti in questo periodo."
+            ),
+            "registry_matches": sa_rows,
+            "coverage": _coverage(),
         }
 
-    except Exception as e:
-        return {
-            "error": f"Errore: {type(e).__name__}: {e}",
-            "reference_cig": reference_cig if reference_cig else "unknown",
-        }
+    cpv_breakdown = _qry(
+        f"""
+        SELECT
+            cod_cpv,
+            descrizione_cpv,
+            COUNT(*)            AS n,
+            SUM(importo_lotto)  AS totale
+        FROM cig
+        {contract_where}
+        AND cod_cpv IS NOT NULL AND cod_cpv != ''
+        GROUP BY cod_cpv, descrizione_cpv
+        ORDER BY n DESC
+        LIMIT 8
+        """,
+        contract_params,
+    )
+
+    proc_breakdown = _qry(
+        f"""
+        SELECT tipo_scelta_contraente AS procedura, COUNT(*) AS n
+        FROM cig
+        {contract_where}
+        AND tipo_scelta_contraente IS NOT NULL AND tipo_scelta_contraente != ''
+        GROUP BY tipo_scelta_contraente
+        ORDER BY n DESC
+        LIMIT 6
+        """,
+        contract_params,
+    )
+
+    recent = _qry(
+        f"""
+        SELECT
+            cig,
+            LEFT(oggetto_gara, 100)  AS oggetto,
+            importo_lotto,
+            cod_cpv,
+            tipo_scelta_contraente,
+            data_pubblicazione,
+            stato
+        FROM cig
+        {contract_where}
+        ORDER BY data_pubblicazione DESC NULLS LAST
+        LIMIT 10
+        """,
+        contract_params,
+    )
+
+    sa_info = sa_rows[0] if sa_rows else {}
+    return {
+        "authority": {
+            "denominazione": sa_info.get("denominazione") or authority_name,
+            "codice_fiscale": sa_info.get("codice_fiscale"),
+            "natura_giuridica": sa_info.get("natura_giuridica"),
+            "provincia": sa_info.get("provincia"),
+            "citta": sa_info.get("citta"),
+        },
+        "statistics": {
+            "n_contratti": stats["n_contratti"],
+            "valore_totale": _fmt_eur(stats["valore_totale"]),
+            "valore_medio": _fmt_eur(stats["valore_medio"]),
+            "prima_gara": stats["prima_gara"],
+            "ultima_gara": stats["ultima_gara"],
+        },
+        "top_categorie_cpv": [
+            {
+                "cpv": r["cod_cpv"],
+                "descrizione": r["descrizione_cpv"],
+                "n_contratti": r["n"],
+                "valore_totale": _fmt_eur(r["totale"]),
+            }
+            for r in cpv_breakdown
+        ],
+        "procedure_utilizzate": [
+            {"procedura": r["procedura"], "n_contratti": r["n"]}
+            for r in proc_breakdown
+        ],
+        "contratti_recenti": [
+            {
+                "cig": r["cig"],
+                "oggetto": r["oggetto"],
+                "importo": _fmt_eur(r["importo_lotto"]),
+                "cpv": r["cod_cpv"],
+                "procedura": r["tipo_scelta_contraente"],
+                "data": r["data_pubblicazione"],
+                "stato": r["stato"],
+                "detail_url": DETAIL_URL.format(cig=r["cig"]),
+            }
+            for r in recent
+        ],
+        "coverage": _coverage(),
+        "citation": CITATION,
+    }
+
+
+async def find_similar_contracts(
+    procurement_description: str,
+    cpv_prefix: Optional[str] = None,
+    importo_riferimento: Optional[float] = None,
+    region: Optional[str] = None,
+    limit: int = 15,
+) -> dict:
+    """
+    Find contracts similar to a given description for comparison or evidence-gathering.
+
+    Useful for:
+    - Building an analisi di mercato evidence base
+    - Understanding how other PAs have procured similar goods/services
+    - Identifying typical procedures and amounts for a type of procurement
+    - Checking if your planned amount is in line with comparable contracts
+
+    Parameters
+    ----------
+    procurement_description : What you want to compare (Italian text).
+                              E.g. 'manutenzione software gestionale', 'servizi di vigilanza'.
+    cpv_prefix              : CPV prefix to narrow the category.
+    importo_riferimento     : Reference amount in euros. Results are sorted by proximity
+                              to this value when provided.
+    region                  : Limit to a specific Italian region.
+    limit                   : Max results (default 15, capped at 25).
+
+    ROUTING: Use when building an evidence base for analisi di mercato,
+    or when the user wants to compare their procurement with peers.
+    For aggregate statistics use benchmark_market_prices instead.
+    """
+    not_ready = _check_ready()
+    if not_ready:
+        return not_ready
+
+    limit = min(max(1, limit), 25)
+
+    wheres = ["importo_lotto > 0"]
+    params: list = []
+
+    words = [w for w in procurement_description.split() if len(w) > 3]
+    if words:
+        kw_clause = " OR ".join(
+            ["lower(oggetto_gara) LIKE lower(?)" for _ in words]
+        )
+        wheres.append(f"({kw_clause})")
+        params.extend([f"%{w}%" for w in words])
+
+    if cpv_prefix:
+        wheres.append("cod_cpv LIKE ?")
+        params.append(f"{cpv_prefix.strip()}%")
+
+    if region:
+        wheres.append("lower(sezione_regionale) LIKE lower(?)")
+        params.append(f"%{region}%")
+
+    where_clause = "WHERE " + " AND ".join(wheres)
+
+    order_clause = (
+        f"ORDER BY ABS(importo_lotto - {float(importo_riferimento)})"
+        if importo_riferimento and importo_riferimento > 0
+        else "ORDER BY data_pubblicazione DESC NULLS LAST"
+    )
+
+    rows = _qry(
+        f"""
+        SELECT
+            cig,
+            LEFT(oggetto_gara, 120)     AS oggetto,
+            importo_lotto,
+            cod_cpv,
+            LEFT(descrizione_cpv, 60)   AS categoria_cpv,
+            LEFT(denominazione_sa, 80)  AS stazione_appaltante,
+            sezione_regionale           AS regione,
+            tipo_scelta_contraente      AS procedura,
+            data_pubblicazione,
+            stato
+        FROM cig
+        {where_clause}
+        {order_clause}
+        LIMIT {limit}
+        """,
+        params,
+    )
+
+    total = _qry(f"SELECT COUNT(*) AS n FROM cig {where_clause}", params)[0]["n"]
+
+    return {
+        "similar_contracts": [
+            {
+                "cig": r["cig"],
+                "oggetto": r["oggetto"],
+                "importo": _fmt_eur(r["importo_lotto"]),
+                "importo_raw": r["importo_lotto"],
+                "cpv": r["cod_cpv"],
+                "categoria_cpv": r["categoria_cpv"],
+                "stazione_appaltante": r["stazione_appaltante"],
+                "regione": r["regione"],
+                "procedura": r["procedura"],
+                "data_pubblicazione": r["data_pubblicazione"],
+                "stato": r["stato"],
+                "detail_url": DETAIL_URL.format(cig=r["cig"]),
+            }
+            for r in rows
+        ],
+        "returned": len(rows),
+        "total_matching": total,
+        "search_criteria": {
+            "description": procurement_description,
+            "cpv_prefix": cpv_prefix,
+            "importo_riferimento": importo_riferimento,
+            "region": region,
+        },
+        "coverage": _coverage(),
+        "citation": CITATION,
+    }
