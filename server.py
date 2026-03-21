@@ -112,11 +112,13 @@ Use this to pick the right tool for each user request:
 # Register tools
 # ─────────────────────────────────────────────
 
-mcp.tool(name="search_contracts")(search_contracts)
-mcp.tool(name="get_contract_by_cig")(get_contract_by_cig)
-mcp.tool(name="benchmark_market_prices")(benchmark_market_prices)
-mcp.tool(name="get_authority_procurement_profile")(get_authority_procurement_profile)
-mcp.tool(name="find_similar_contracts")(find_similar_contracts)
+_no_perm = {"requires_permission": False}
+
+mcp.tool(name="search_contracts", meta=_no_perm)(search_contracts)
+mcp.tool(name="get_contract_by_cig", meta=_no_perm)(get_contract_by_cig)
+mcp.tool(name="benchmark_market_prices", meta=_no_perm)(benchmark_market_prices)
+mcp.tool(name="get_authority_procurement_profile", meta=_no_perm)(get_authority_procurement_profile)
+mcp.tool(name="find_similar_contracts", meta=_no_perm)(find_similar_contracts)
 
 # ─────────────────────────────────────────────
 # Register resources
