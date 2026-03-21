@@ -58,9 +58,25 @@ _request_times: list[float] = []
 # The real ANAC API gateway throttles after ~5 requests in a burst;
 # staying at 4/min with a minimum 15s gap is safe for sustained use.
 RATE_LIMIT_PER_MINUTE = 4
-# Each /releases call takes ~50s to return; enforce only a 5s inter-request gap.
-# The natural call duration provides most of the rate limiting itself.
 MIN_GAP_SECONDS = 5.0
+
+# ─────────────────────────────────────────────
+# Startup cache
+# ─────────────────────────────────────────────
+# The ANAC /releases endpoint is slow (15-30s per record from European DCs,
+# potentially 60s+ from US cloud). To prevent Intric's 120s MCP timeout from
+# triggering, we pre-fetch releases in a background thread at module load time
+# and serve all tool calls from the in-memory cache.
+#
+# Cache lifecycle:
+#   - Background thread starts immediately when tools.py is imported
+#   - Tries to fetch limit=3 releases (~45-90s depending on network)
+#   - Refreshes every CACHE_TTL_SECONDS (30 min) thereafter
+#   - Tools read from cache instantly; if cache is empty they return a
+#     "warming up" response rather than timing out
+_release_cache: dict = {"releases": [], "updated_at": 0.0, "warming": True}
+_cache_lock = threading.Lock()
+CACHE_TTL_SECONDS = 1800   # 30 minutes
 
 
 def _get(url: str, params: dict = None, timeout: float = 45.0) -> httpx.Response:
@@ -250,31 +266,77 @@ def _current_year() -> int:
 # Internal: fetch tender IDs for a date range
 # ─────────────────────────────────────────────
 
-def _fetch_recent_releases(limit: int = 10) -> list[dict]:
+def _do_api_fetch_releases(limit: int = 3) -> list[dict]:
     """
-    Fetch the most recent ANAC contracts via GET /releases?limit=N.
+    Raw blocking fetch of recent ANAC releases. Slow (45-90s from cloud DCs).
+    Do NOT call from tool handlers — use _fetch_recent_releases() which reads
+    from the in-memory cache instead.
 
-    This is the only reliable read path on the ANAC OCDS API:
-    - /releases?limit=10 → works, returns 10 most recent contracts
-    - /releases?limit=20 → times out on ANAC's backend
-    - /tender/ids → returns IDs that mostly don't resolve (~10% hit rate)
-    - /releases/ocids → offset param not implemented, no real pagination
-
-    Max safe limit is 10. Calling this multiple times returns the SAME 10
-    records (no cursor/offset). Use client-side filtering on the result.
+    API notes (verified from live testing):
+    - /releases?limit=3 → ~45s locally, potentially 90s+ from Railway/cloud
+    - /releases?limit=10 → times out (>120s)
+    - /releases/ocids offset is broken; /releases/{ocid} also slow
+    - Only limit=3 with a 120s timeout is reliably safe
     """
-    # ANAC API response time varies: ~15s per release under normal load, up to 30s
-    # under heavy load. Use limit=3 with a 120s timeout as the safe batch size.
-    # limit=5 can take 75-100s+ under load; limit=3 stays within ~60s reliably.
     safe_limit = min(limit, 3)
-    resp = _get(f"{OCDS_BASE}/releases", params={"limit": str(safe_limit)}, timeout=120.0)
-    if resp.status_code != 200 or _is_waf_block(resp) or _is_throttle(resp):
-        return []
     try:
+        resp = _get(f"{OCDS_BASE}/releases", params={"limit": str(safe_limit)}, timeout=120.0)
+        if resp.status_code != 200 or _is_waf_block(resp) or _is_throttle(resp):
+            return []
         data = resp.json()
         return data if isinstance(data, list) else []
     except Exception:
         return []
+
+
+def _background_cache_worker() -> None:
+    """
+    Background thread: fetch ANAC releases once at startup, then refresh every
+    CACHE_TTL_SECONDS. Runs as a daemon so it never blocks server shutdown.
+    """
+    while True:
+        try:
+            print("[ANAC cache] fetching releases from API…")
+            releases = _do_api_fetch_releases(limit=3)
+            with _cache_lock:
+                if releases:
+                    _release_cache["releases"] = releases
+                    _release_cache["updated_at"] = time.time()
+                    _release_cache["warming"] = False
+                    print(f"[ANAC cache] warmed with {len(releases)} releases")
+                else:
+                    print("[ANAC cache] fetch returned empty — will retry after TTL")
+        except Exception as exc:
+            print(f"[ANAC cache] background refresh error: {exc}")
+        time.sleep(CACHE_TTL_SECONDS)
+
+
+# Start background cache refresh immediately at module import.
+# By the time the first MCP tool call arrives the cache is likely warm.
+_cache_thread = threading.Thread(target=_background_cache_worker, daemon=True, name="anac-cache")
+_cache_thread.start()
+
+
+def _fetch_recent_releases(limit: int = 3) -> list[dict]:
+    """
+    Return recent ANAC releases from the in-memory cache (instant).
+    Falls back to a live API call only if the cache has never been populated.
+    Returns an empty list (never raises) — callers handle the empty case.
+    """
+    with _cache_lock:
+        releases = _release_cache["releases"]
+        age = time.time() - _release_cache["updated_at"]
+        warming = _release_cache["warming"]
+
+    if releases and age < CACHE_TTL_SECONDS * 2:   # serve even slightly stale cache
+        return releases[:limit]
+
+    if warming:
+        # Cache not yet populated — return empty; callers will surface the warming message
+        return []
+
+    # Cache expired — try a live fetch (may be slow, but cache was working before)
+    return _do_api_fetch_releases(limit=min(limit, 3))
 
 
 def _get_tender_ids(date_from: str, date_to: str, limit: int = 20, offset: int = 0) -> list[str]:
@@ -410,6 +472,21 @@ def search_contracts(
         releases = _fetch_recent_releases(limit=10)
 
         if not releases:
+            with _cache_lock:
+                is_warming = _release_cache["warming"]
+            if is_warming:
+                return {
+                    "contracts": [],
+                    "total_fetched": 0,
+                    "status": "warming_up",
+                    "message": (
+                        "Il server MCP si sta avviando e sta pre-caricando i dati dall'API ANAC. "
+                        "L'operazione richiede 60-90 secondi alla prima accensione. "
+                        "Riprova tra un minuto."
+                    ),
+                    "source": "ANAC OCDS API",
+                    "citation": CITATION,
+                }
             return {
                 "contracts": [],
                 "total_fetched": 0,
